@@ -25,6 +25,9 @@ x-pixelfed-env: &pixelfed-env
   DB_PASSWORD: ${PIXELFED_DB_PASSWORD}
   REDIS_HOST: ${REDIS_MAGIC_NAME}.${TS_TAILNET}
   REDIS_PORT: "6379"
+  # Shared password for the main Redis instance. Pixelfed keeps its default
+  # logical DBs (0 cache/queue, 1 session, 2 pulse) — all on this instance.
+  REDIS_PASSWORD: ${REDIS_APPS_PASSWORD}
   # ---- Instance identity ----
   APP_NAME: ${PIXELFED_APP_NAME:-Pixelfed}
   APP_TIMEZONE: ${PIXELFED_TIMEZONE:-UTC}
@@ -73,19 +76,24 @@ x-pixelfed-env: &pixelfed-env
   MAIL_FROM_NAME: ${SMTP_FROM_NAME:-Pixelfed}
   # ---- Object storage (S3 via Garage) — opt in ----
   # Set PIXELFED_ENABLE_CLOUD=true in .env to store uploads in Garage instead
-  # of the local pixelfed-storage volume. Requires GARAGE_ACCESS_KEY_ID and
-  # GARAGE_SECRET_ACCESS_KEY. AWS_USE_PATH_STYLE_ENDPOINT is required — Garage
-  # uses path-style API (http://endpoint/bucket/key).
+  # of the local pixelfed-storage volume. Requires the per-app Garage key
+  # (PIXELFED_GARAGE_KEY_ID/SECRET, printed by provision-garage) — it can
+  # reach ONLY the pixelfed-media bucket. AWS_USE_PATH_STYLE_ENDPOINT is
+  # required — Garage uses path-style API (http://endpoint/bucket/key).
   PF_ENABLE_CLOUD: ${PIXELFED_ENABLE_CLOUD:-false}
   FILESYSTEM_CLOUD: s3
   PF_LOCAL_AVATAR_TO_CLOUD: ${PIXELFED_LOCAL_AVATAR_TO_CLOUD:-false}
   MEDIA_DELETE_LOCAL_AFTER_CLOUD: ${PIXELFED_DELETE_LOCAL_AFTER_CLOUD:-false}
-  AWS_ACCESS_KEY_ID: ${GARAGE_ACCESS_KEY_ID:-}
-  AWS_SECRET_ACCESS_KEY: ${GARAGE_SECRET_ACCESS_KEY:-}
+  AWS_ACCESS_KEY_ID: ${PIXELFED_GARAGE_KEY_ID:-}
+  AWS_SECRET_ACCESS_KEY: ${PIXELFED_GARAGE_KEY_SECRET:-}
   AWS_DEFAULT_REGION: ${GARAGE_REGION:-garage}
   AWS_BUCKET: ${PIXELFED_S3_BUCKET:-pixelfed-media}
   # Inline MagicDNS — Compose does not expand vars inside vars.
-  AWS_ENDPOINT: http://${GARAGE_MAGIC_NAME}.${TS_TAILNET}:3900
+  # S3 API endpoint. GARAGE_S3_ENDPOINT_NAME defaults to the single Garage
+  # node ("garage"); for a multi-node cluster set it to the reverse-proxy
+  # host's MagicDNS name to reach the HA load-balancer (README "Highly
+  # available S3 endpoint").
+  AWS_ENDPOINT: http://${GARAGE_S3_ENDPOINT_NAME:-garage}.${TS_TAILNET}:3900
   AWS_USE_PATH_STYLE_ENDPOINT: "true"
   # Optional CDN URL for public media. Leave blank = use Garage endpoint.
   AWS_URL: ${PIXELFED_S3_URL:-}

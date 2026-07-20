@@ -1,9 +1,12 @@
 # Shared Postgres + Redis for every app stack in this repo.
 #
 # Each data container shares a Tailscale sidecar's network namespace via
-# network_mode: "service:ts-<role>", so its only network interfaces are
-# `lo` and `tailscale0`. There are no `ports:` directives anywhere — the
-# data services are reachable from the tailnet only, gated by ACL tags.
+# network_mode: "service:ts-<role>". There are no `ports:` directives
+# anywhere — the data services are reachable from the tailnet only, gated
+# by ACL tags. (Precisely: the shared netns also carries the compose
+# project's bridge interface for coordination-server egress, reachable
+# from the host and same-project containers — parties the model already
+# trusts. See SECURITY.md §1.1; pg_hba.conf closes that path for Postgres.)
 #
 # Bring this up FIRST. Wait for both sidecars to appear in your Tailscale
 # admin console before starting any app stack.
@@ -18,11 +21,16 @@ services:
 
   ts-postgres:
     image: tailscale/tailscale:${TAILSCALE_VERSION:-v1.98.4}
-    hostname: ${DB_MAGIC_NAME}
+    # This node's OWN MagicDNS name. Single-node: leave PG_NODE_MAGIC_NAME
+    # unset so it defaults to "pgsql-prod" (== DB_MAGIC_NAME) and apps reach
+    # Postgres directly. HA: each Postgres host sets its own PG_NODE_MAGIC_NAME
+    # (e.g. pg-primary / pg-standby), and DB_MAGIC_NAME instead names the
+    # pg-router sidecar that apps dial. See README "Postgres high availability".
+    hostname: ${PG_NODE_MAGIC_NAME:-pgsql-prod}
     environment:
       TS_AUTHKEY: ${TS_OAUTH_CLIENT_SECRET}?ephemeral=true
       TS_EXTRA_ARGS: --advertise-tags=tag:db-postgres
-      TS_HOSTNAME: ${DB_MAGIC_NAME}
+      TS_HOSTNAME: ${PG_NODE_MAGIC_NAME:-pgsql-prod}
       TS_ACCEPT_DNS: "true"
       TS_AUTH_ONCE: "true"
       TS_USERSPACE: "false"
@@ -48,12 +56,29 @@ services:
   postgres:
     image: postgres:16-alpine
     network_mode: "service:ts-postgres"
-    # Postgres listens on all interfaces inside this netns. The netns has
-    # only `lo` and `tailscale0` — there is no host or bridge interface to
-    # leak onto. Access is gated by Tailscale ACLs (see acl.example.hujson).
+    # Postgres listens on all interfaces inside this netns — including the
+    # compose bridge (eth0) the sidecar needs for coordination-server egress
+    # (SECURITY.md §1.1). The mounted pg_hba.conf restricts TCP connections
+    # to the tailnet CGNAT/ULA ranges plus loopback, so the bridge path is
+    # rejected at the auth layer without touching iptables. Tailnet-side
+    # access is gated by Tailscale ACLs (see acl.example.hujson).
+    # pg-entrypoint.sh wraps the stock entrypoint: a no-op for a primary
+    # (single-node behaviour unchanged), and a pg_basebackup clone for an
+    # empty standby (PG_ROLE=standby). command is passed through to the stock
+    # entrypoint unchanged.
+    entrypoint: ["/usr/local/bin/pg-entrypoint.sh"]
+    command: ["postgres", "-c", "hba_file=/etc/postgresql/pg_hba.conf"]
     environment:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
       POSTGRES_DB: postgres
+      # HA replication (see README "Postgres high availability"). All default
+      # to a single-node primary, so an unconfigured deployment is unchanged.
+      PG_ROLE: ${PG_ROLE:-primary}
+      PG_PRIMARY_MAGIC_NAME: ${PG_PRIMARY_MAGIC_NAME:-}
+      TS_TAILNET: ${TS_TAILNET:-}
+      REPLICATION_USER: ${REPLICATION_USER:-replicator}
+      REPLICATION_PASSWORD: ${REPLICATION_PASSWORD:-}
+      PG_REPLICATION_SLOT: ${PG_REPLICATION_SLOT:-standby_slot}
       # Surfaced to the init script so it can mint per-app users/dbs.
       PIXELFED_DB_NAME: ${PIXELFED_DB_NAME}
       PIXELFED_DB_USER: ${PIXELFED_DB_USER}
@@ -76,6 +101,10 @@ services:
     volumes:
       - pg-data:/var/lib/postgresql/data
       - ./initdb:/docker-entrypoint-initdb.d:ro
+      # Tracked in git — static policy, no secrets. See the file's comments.
+      - ./pg_hba.conf:/etc/postgresql/pg_hba.conf:ro
+      # Standby-clone wrapper (no-op for a primary). Tracked, executable.
+      - ./pg-entrypoint.sh:/usr/local/bin/pg-entrypoint.sh:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres"]
       interval: 10s
@@ -117,13 +146,35 @@ services:
       start_period: 30s
     restart: unless-stopped
 
+  # Main Redis — fediverse apps (logical DBs 0-2) and Stalwart (DB 3).
+  # Password-authenticated (REDIS_APPS_PASSWORD). Authelia does NOT live
+  # here: its session store runs in the separate redis-authelia instance
+  # below, so a compromised fediverse app holding this password cannot
+  # read or forge SSO session state (SECURITY.md §3.2 / §5.7).
+  #
+  # Why instance separation instead of Redis ACL users: ACL rules cannot
+  # scope SELECT to a logical DB index, two apps in this stack (Pixelfed,
+  # PeerTube) support password-only auth (no ACL usernames), and Pixelfed's
+  # Predis client unconditionally SELECTs its session/pulse DBs on connect.
+  # A second instance behind a port-scoped tailnet ACL grant is the boundary
+  # Redis logical DBs never were.
   redis:
     image: redis:7-alpine
     network_mode: "service:ts-redis"
-    # `--protected-mode no` is required because Redis sees itself bound to
-    # 0.0.0.0 (the only interfaces in this netns are lo and tailscale0).
-    # Tailscale ACLs are the gate. No password — see .env.example.
-    command: ["redis-server", "--appendonly", "yes", "--protected-mode", "no"]
+    command:
+      - redis-server
+      - --appendonly
+      - "yes"
+      # Redis sees itself bound to 0.0.0.0 inside the shared netns; the
+      # tailnet ACL plus the password below are the gates.
+      - --protected-mode
+      - "no"
+      - --requirepass
+      - ${REDIS_APPS_PASSWORD}
+    environment:
+      # Lets the healthcheck's redis-cli authenticate without leaking the
+      # password into `docker inspect` healthcheck args or process lists.
+      REDISCLI_AUTH: ${REDIS_APPS_PASSWORD}
     volumes:
       - redis-data:/data
     healthcheck:
@@ -136,6 +187,39 @@ services:
         condition: service_healthy
     restart: unless-stopped
 
+  # Authelia's dedicated Redis — SSO session store, its own password, on
+  # its own port (6380). Shares the ts-redis sidecar netns, so it is the
+  # same tailnet node; the ACL grants tag:authelia (and nothing else)
+  # access to tcp/6380. Fediverse apps hold only REDIS_APPS_PASSWORD and
+  # have no grant to this port.
+  redis-authelia:
+    image: redis:7-alpine
+    network_mode: "service:ts-redis"
+    command:
+      - redis-server
+      - --port
+      - "6380"
+      - --appendonly
+      - "yes"
+      - --protected-mode
+      - "no"
+      - --requirepass
+      - ${REDIS_AUTHELIA_PASSWORD}
+    environment:
+      REDISCLI_AUTH: ${REDIS_AUTHELIA_PASSWORD}
+    volumes:
+      - redis-authelia-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "-p", "6380", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+    depends_on:
+      ts-redis:
+        condition: service_healthy
+    restart: unless-stopped
+
 volumes:
   pg-data:
   redis-data:
+  redis-authelia-data:

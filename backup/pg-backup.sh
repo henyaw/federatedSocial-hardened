@@ -24,7 +24,7 @@
 #   - docker available; the aws-cli runs as a throwaway container
 #     (amazon/aws-cli) so nothing extra is installed on the host.
 #   - provision-garage has run (creates the pg-backups bucket + key) and
-#     GARAGE_ACCESS_KEY_ID / GARAGE_SECRET_ACCESS_KEY are set in .env.
+#     PG_BACKUP_GARAGE_KEY_ID / PG_BACKUP_GARAGE_KEY_SECRET are set in .env.
 
 set -euo pipefail
 
@@ -46,9 +46,12 @@ GARAGE_REGION="${GARAGE_REGION:-garage}"
 # non-issue. Bump intentionally, verify, then move the pin. Override via .env.
 AWSCLI_IMAGE="${AWSCLI_IMAGE:-amazon/aws-cli:2.35.8}"
 
-GARAGE_ENDPOINT="http://${GARAGE_MAGIC_NAME}.${TS_TAILNET}:3900"
+# GARAGE_S3_ENDPOINT_NAME defaults to the single node ("garage"); in a
+# multi-node cluster set it to the reverse-proxy host so backups ship through
+# the HA S3 load-balancer (README "Highly available S3 endpoint").
+GARAGE_ENDPOINT="http://${GARAGE_S3_ENDPOINT_NAME:-garage}.${TS_TAILNET}:3900"
 
-for v in GARAGE_MAGIC_NAME TS_TAILNET GARAGE_ACCESS_KEY_ID GARAGE_SECRET_ACCESS_KEY DB_MAGIC_NAME; do
+for v in TS_TAILNET PG_BACKUP_GARAGE_KEY_ID PG_BACKUP_GARAGE_KEY_SECRET DB_MAGIC_NAME; do
   [[ -n "${!v:-}" ]] || { echo "Error: ${v} is not set in .env" >&2; exit 1; }
 done
 
@@ -64,8 +67,8 @@ log() { echo "[pg-backup] $*"; }
 # checksums to when_required restores S3-compat without pinning the image.
 aws_garage() {
   docker run --rm -i --network host \
-    -e AWS_ACCESS_KEY_ID="${GARAGE_ACCESS_KEY_ID}" \
-    -e AWS_SECRET_ACCESS_KEY="${GARAGE_SECRET_ACCESS_KEY}" \
+    -e AWS_ACCESS_KEY_ID="${PG_BACKUP_GARAGE_KEY_ID}" \
+    -e AWS_SECRET_ACCESS_KEY="${PG_BACKUP_GARAGE_KEY_SECRET}" \
     -e AWS_DEFAULT_REGION="${GARAGE_REGION}" \
     -e AWS_REQUEST_CHECKSUM_CALCULATION=when_required \
     -e AWS_RESPONSE_CHECKSUM_VALIDATION=when_required \

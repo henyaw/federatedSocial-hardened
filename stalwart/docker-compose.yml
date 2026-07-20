@@ -48,7 +48,7 @@ services:
       # S3 (Garage). If Garage isn't reachable on first boot, the UI blob
       # write fails silently and the admin site never loads. This is the exact
       # failure mode that motivated the nc-check pattern (see LESSONS.md).
-      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:9002/healthz && nc -z -w3 ${DB_MAGIC_NAME}.${TS_TAILNET} 5432 && nc -z -w3 ${GARAGE_MAGIC_NAME}.${TS_TAILNET} 3900"]
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:9002/healthz && nc -z -w3 ${DB_MAGIC_NAME}.${TS_TAILNET} 5432 && nc -z -w3 ${GARAGE_S3_ENDPOINT_NAME:-garage}.${TS_TAILNET} 3900"]
       interval: 10s
       timeout: 15s
       retries: 6

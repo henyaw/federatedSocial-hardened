@@ -8,7 +8,7 @@ A Tailscale-native, "play-not-work" deployment template for self-hosted federate
 
 The design goal: an unseasoned operator should be able to clone this repo, edit one `.env` file, paste one ACL JSON into the Tailscale admin console, and run `docker compose up -d` in each stack directory. They should never need to touch iptables, learn Docker networking internals, or hand-configure TLS for internal services.
 
-The security model is **Tailscale ACLs over Docker network namespaces**, not host firewall rules. Internal services (Postgres, Redis) have zero exposure to the host network — their only reachable interface is `tailscale0` inside their sidecar's namespace. The host Nginx terminates public TLS and proxies to public-facing app tiers via MagicDNS.
+The security model is **Tailscale ACLs over Docker network namespaces**, not host firewall rules. Internal services (Postgres, Redis) publish no ports and are unreachable from the internet or LAN; their reachable interface is `tailscale0` inside their sidecar's namespace (plus the compose project's bridge, visible only to the host and same-project containers — see SECURITY.md §1.1). The host Nginx terminates public TLS and proxies to public-facing app tiers via MagicDNS.
 
 ## Architecture
 
@@ -25,8 +25,8 @@ Every container that needs tailnet identity gets its own `tailscale/tailscale` s
 
 - The app container has no network interfaces of its own.
 - The app's "localhost" is the sidecar's localhost.
-- The app's only outbound path is through `tailscale0`.
-- There is no Docker bridge network involved for these containers, and no `ports:` mapping is possible or appropriate.
+- The app's tailnet path is `tailscale0`. (The shared netns also has the compose project's default bridge — the sidecar needs it to reach the Tailscale coordination server. It is NATed egress only, reachable inbound solely from the host and same-project containers; see SECURITY.md §1.1. Postgres additionally rejects non-tailnet sources via `pg_hba.conf`.)
+- No explicit `networks:` are attached to these containers, and no `ports:` mapping is possible or appropriate.
 
 This is the security boundary. **Do not break it.**
 
@@ -102,7 +102,8 @@ When adding a new app or component, add its env vars to `.env.example` with sens
 Two cross-cutting concerns are configured **once** and mapped into every app, rather than per-app:
 
 - **SMTP relay**: `SMTP_HOST` / `SMTP_PORT` / `SMTP_USER` / `SMTP_PASSWORD` / `SMTP_FROM_NAME`. Each app's compose maps these into the app-specific names it expects (Mastodon `SMTP_SERVER`, GoToSocial `GTS_SMTP_HOST`, PeerTube `PEERTUBE_SMTP_HOSTNAME`, Pixelfed `MAIL_HOST`, Diaspora `CONFIGURATION_MAIL_SMTP_HOST`). Funkwhale is the exception — it takes a single `EMAIL_CONFIG` connection string, so it can't read the discrete vars; document the `smtp+tls://` form with the URL-encoding caveat instead.
-- **Garage S3**: `GARAGE_ACCESS_KEY_ID` / `GARAGE_SECRET_ACCESS_KEY` / `GARAGE_REGION`, mapped into each app's S3 opt-in block.
+- **Garage S3**: `GARAGE_REGION` is shared; access keys are **per-app** (`<APP>_GARAGE_KEY_ID` / `<APP>_GARAGE_KEY_SECRET`, minted by `bootstrap.sh provision-garage`, each scoped to only that app's buckets — SECURITY.md §5.7). When adding a new app with object storage, add its bucket + key mapping to `provision-garage` and its key pair to `.env.example`; never point a new app at another app's key.
+- **Redis**: two password-protected instances behind the one `ts-redis` sidecar — main (`:6379`, `REDIS_APPS_PASSWORD`, fediverse apps + Stalwart) and Authelia-only (`:6380`, `REDIS_AUTHELIA_PASSWORD`, its own ACL grant). Redis logical DB indices are namespacing, not a security boundary; anything session/identity-critical belongs on a separate instance behind a port-scoped grant, not on another index.
 
 Per-app values that legitimately differ (sender addresses, bucket names, enable toggles) stay in the app's own section. When adding a new app, wire its SMTP and S3 to the shared vars; only add a new per-app var when the value genuinely can't be shared.
 
@@ -176,7 +177,7 @@ Hard rules:
 This is the most important property of the repo. Internal services (Postgres, Redis, anything in `shared-db/` or future internal stacks) must satisfy all three:
 
 1. **No `ports:` mapping anywhere in their compose file.**
-2. **The data container uses `network_mode: "service:<sidecar>"`** so it has no interface other than `tailscale0`.
+2. **The data container uses `network_mode: "service:<sidecar>"`** so it cannot publish ports or join extra networks; its externally reachable interface is `tailscale0` (SECURITY.md §1.1 covers the host-only bridge caveat).
 3. **Tailscale ACLs gate access by tag**, not by IP or hostname.
 
 If a change would violate any of these, stop and surface it to the user. Do not "just add a port for debugging" — operators should debug via `tailscale ssh` or a temporary admin tag in the ACL, never by exposing a host port.
@@ -311,7 +312,7 @@ Compose `depends_on` cannot enforce this across separate compose files. The heal
 
 These are deliberately unresolved and should be flagged to the user when relevant, not silently decided:
 
-- **Multi-host clustering**: current design is single-host. Moving Postgres to a dedicated host on the tailnet is a known future step but not implemented.
+- **Multi-host clustering**: partially implemented. **Garage** clusters across multiple hosts today — set `GARAGE_REPLICATION_FACTOR>1`, run the `garage/` stack per host with a per-host `GARAGE_MAGIC_NAME`/`GARAGE_ZONE`, and assemble `GARAGE_BOOTSTRAP_PEERS` from each node's `bootstrap.sh garage-peer-id` (see the Garage cluster block in `.env.example`, the multi-node branch in `bootstrap.sh`'s `cmd_up`/`cmd_provision_garage`, and the `tag:garage → tag:garage:3901` ACL grant). **Postgres** now has an opt-in HA path (uptime, not backups): a `pg_basebackup` streaming hot-standby on a second host (`PG_ROLE=standby`, per-host `PG_NODE_MAGIC_NAME`, shared `REPLICATION_*`), a `pg-router/` nginx-stream sidecar that takes the `DB_MAGIC_NAME` identity and forwards to `PG_PRIMARY_MAGIC_NAME` (so apps are unchanged), manual promotion (`bootstrap.sh pg-promote`) + router repoint on failover, and re-clone via `pg-rejoin`. The `tag:db-postgres → tag:db-postgres:5432` self-grant covers replication + router→primary. Async replication + manual failover is deliberate (no etcd/Patroni) for the single-operator threat model; keep the invariant that the standby entrypoint (`shared-db/pg-entrypoint.sh`) is a strict no-op for a primary so single-node stays byte-identical. **Redis is intentionally left single-instance** — it's cache/queue here (Authelia sessions are the only stateful bit, and losing them just forces re-login), so the HA complexity isn't worth it; a Redis outage degrades rather than destroys. When touching Garage clustering, keep the invariant that peers are addressed by stable MagicDNS name (`rpc_public_addr`/`bootstrap_peers`), never by ephemeral tailnet IP. Apps reach the S3 API at `${GARAGE_S3_ENDPOINT_NAME}.${TS_TAILNET}:3900` (defaults to the single node); for a cluster, HA is optional via a **layer-4 (TCP)** S3 load-balancer on the reverse-proxy host (`nginx/sites-available/garage-s3.conf` or the `caddy/Caddyfile` layer4 block) — it must stay L4, because S3 SigV4 signs the Host header and path and an HTTP proxy that rewrites either breaks the signature. The matching ACL grants are `tag:reverse-proxy → tag:garage:3900` and `<app tags> → tag:reverse-proxy:3900`.
 - **Backup strategy for `pg-data` and similar volumes**: not yet templated. Operator's responsibility for now.
 - **Cert management for host Nginx**: assumed to be the operator's existing process (Let's Encrypt via certbot or similar). Not in scope for this repo.
 - **Object storage for media**: PeerTube has S3 templated (opt-in via `PEERTUBE_OBJECT_STORAGE_*` env vars in `.env.example`). Pixelfed and Funkwhale are still local-volume only — retrofit them with the same `<APP>_OBJECT_STORAGE_*` pattern when an operator needs it.

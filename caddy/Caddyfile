@@ -135,6 +135,31 @@
         }
       }
     }
+
+    # ---- Garage S3 API HA load-balancer (OPTIONAL, multi-node only) ----
+    # Fronts the S3 API (:3900) of every Garage cluster node so app -> S3
+    # traffic fails over automatically instead of depending on one node.
+    # Enable by uncommenting; then set GARAGE_S3_ENDPOINT_NAME in .env to
+    # THIS host's MagicDNS name so apps target the LB. It is a plain TCP
+    # (layer4) proxy — S3 SigV4 signs the Host header and path, so the bytes
+    # must pass through unaltered; Garage validates the exact request the app
+    # signed. Bind THIS host's Tailscale IP (`tailscale ip -4`) so :3900 is
+    # never offered publicly. Requires ACL grants tag:reverse-proxy ->
+    # tag:garage:3900 and <app tags> -> tag:reverse-proxy:3900 (both in
+    # acl.example.hujson). nginx-stream equivalent: nginx/sites-available/garage-s3.conf.
+    #
+    # 100.x.y.z:3900 {
+    #   route {
+    #     proxy {
+    #       upstream garage-1.tailfe8c.ts.net:3900
+    #       upstream garage-2.tailfe8c.ts.net:3900
+    #       upstream garage-3.tailfe8c.ts.net:3900
+    #       lb_policy round_robin
+    #       health_interval 10s
+    #       health_timeout 3s
+    #     }
+    #   }
+    # }
   }
 }
 

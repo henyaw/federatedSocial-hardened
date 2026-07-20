@@ -55,9 +55,10 @@ concurrency = 5
 
 [configuration.server]
 
-## Bind on all interfaces inside the sidecar netns. The netns has only
-## `lo` and `tailscale0`; reachability is gated by the host reverse
-## proxy via MagicDNS + the tag:reverse-proxy ACL grant.
+## Bind on all interfaces inside the sidecar netns. Tailnet reachability
+## is gated by the host reverse proxy via MagicDNS + the tag:reverse-proxy
+## ACL grant; the netns' compose-bridge side is reachable only from the
+## host / same-project containers (SECURITY.md §1.1).
 ## tcp:// prefix is required by Puma 7.x (Diaspora 1.x ships with Puma 7).
 listen = "tcp://0.0.0.0:3000"
 

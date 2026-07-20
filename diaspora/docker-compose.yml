@@ -56,7 +56,9 @@ services:
       # Diaspora's settings reader maps these onto the YAML config tree
       # via the documented dotted-path → upper-snake-case rule.
       ENVIRONMENT_URL: ${DIASPORA_URL}
-      ENVIRONMENT_REDIS: redis://${REDIS_MAGIC_NAME}.${TS_TAILNET}:6379
+      # Password embedded in the URL — REDIS_APPS_PASSWORD must be URL-safe
+      # (openssl rand -hex 32; see .env.example).
+      ENVIRONMENT_REDIS: redis://:${REDIS_APPS_PASSWORD}@${REDIS_MAGIC_NAME}.${TS_TAILNET}:6379
 
       # Email — configuration.mail.* config keys mapped to env vars with the
       # same convention as ENVIRONMENT_* above (keep top-level section, dots

@@ -35,7 +35,9 @@ x-api-env: &api-env
   FUNKWHALE_PROTOCOL: https
   DJANGO_SECRET_KEY: ${FUNKWHALE_DJANGO_SECRET_KEY}
   DATABASE_URL: postgresql://${FUNKWHALE_DB_USER}:${FUNKWHALE_DB_PASSWORD}@${DB_MAGIC_NAME}.${TS_TAILNET}:5432/${FUNKWHALE_DB_NAME}
-  CACHE_URL: redis://${REDIS_MAGIC_NAME}.${TS_TAILNET}:6379/0
+  # Password embedded in the URL — REDIS_APPS_PASSWORD must be URL-safe
+  # (openssl rand -hex 32; see .env.example).
+  CACHE_URL: redis://:${REDIS_APPS_PASSWORD}@${REDIS_MAGIC_NAME}.${TS_TAILNET}:6379/0
   MEDIA_ROOT: /srv/funkwhale/data/media
   STATIC_ROOT: /srv/funkwhale/data/static
   MUSIC_DIRECTORY_PATH: /music
@@ -56,16 +58,20 @@ x-api-env: &api-env
   # Set FUNKWHALE_S3_ENABLED=true in .env to store uploads in Garage instead of
   # the funkwhale-media volume. Funkwhale switches to S3 whenever
   # AWS_ACCESS_KEY_ID is non-empty, so the creds + endpoint below are gated on
-  # the flag (blank => local volume). Reuses the shared GARAGE_* key.
+  # the flag (blank => local volume). Uses the per-app Garage key
+  # (FUNKWHALE_GARAGE_KEY_ID/SECRET) — scoped to funkwhale-music only.
   # NOTE: Funkwhale has NO OIDC/SSO support upstream (OAuth2 + LDAP only), so
   # this stack is S3-only — there is no Authelia client for it.
-  AWS_ACCESS_KEY_ID: ${FUNKWHALE_S3_ENABLED:+${GARAGE_ACCESS_KEY_ID}}
-  AWS_SECRET_ACCESS_KEY: ${FUNKWHALE_S3_ENABLED:+${GARAGE_SECRET_ACCESS_KEY}}
+  AWS_ACCESS_KEY_ID: ${FUNKWHALE_S3_ENABLED:+${FUNKWHALE_GARAGE_KEY_ID}}
+  AWS_SECRET_ACCESS_KEY: ${FUNKWHALE_S3_ENABLED:+${FUNKWHALE_GARAGE_KEY_SECRET}}
   AWS_STORAGE_BUCKET_NAME: ${FUNKWHALE_S3_BUCKET:-funkwhale-music}
   AWS_S3_REGION_NAME: ${GARAGE_REGION:-garage}
   # Endpoint is built inline (Compose can't expand vars inside vars) and gated
   # on the flag — empty unless S3 is enabled.
-  AWS_S3_ENDPOINT_URL: ${FUNKWHALE_S3_ENABLED:+http://${GARAGE_MAGIC_NAME}.${TS_TAILNET}:3900}
+  # GARAGE_S3_ENDPOINT_NAME defaults to the single node; point it at the
+  # reverse-proxy host for the HA S3 load-balancer (README "Highly available
+  # S3 endpoint").
+  AWS_S3_ENDPOINT_URL: ${FUNKWHALE_S3_ENABLED:+http://${GARAGE_S3_ENDPOINT_NAME:-garage}.${TS_TAILNET}:3900}
   # Serve media through the front nginx via X-Accel-Redirect rather than handing
   # browsers direct Garage URLs — Garage's S3 API is tailnet-only and signed, so
   # direct URLs are unreachable publicly. Keeps S3 working with NO separate
@@ -107,8 +113,9 @@ services:
 
   # Django/Gunicorn ASGI. server.sh runs migrate + collectstatic before
   # starting gunicorn — generous start_period covers first-boot migrations.
-  # Binds to 0.0.0.0:5000 inside this netns (lo + tailscale0 only; no host
-  # or bridge interface). Port 5000 is gated by ACL to autogroup:admin only.
+  # Binds to 0.0.0.0:5000 inside this netns. Tailnet-side, port 5000 is
+  # gated by ACL to autogroup:admin only; the netns' compose-bridge side is
+  # reachable only from the host / same-project containers (SECURITY.md §1.1).
   api:
     image: funkwhale/api:${FUNKWHALE_VERSION:-1.3.4}
     network_mode: "service:ts-funkwhale-web"

@@ -65,8 +65,8 @@ services:
       GTS_CONFIG_PATH: /gotosocial/config.yaml
       # ---- Object storage (S3 via Garage) — opt in ----
       # Set GOTOSOCIAL_STORAGE_BACKEND=s3 in .env to store media in Garage
-      # instead of the local gotosocialuploads volume. Credentials come from
-      # the shared GARAGE_* block — no per-app key needed.
+      # instead of the local gotosocialuploads volume. Credentials are the
+      # per-app Garage key (provision-garage) — scoped to gotosocial-media.
       #
       # PITFALL: GoToSocial uses the minio-go client, so the endpoint is
       # host:port ONLY, with NO scheme. A "http://" prefix triggers
@@ -74,10 +74,13 @@ services:
       # selected by USE_SSL instead — false for Garage's plaintext tailnet
       # endpoint. (This differs from Pixelfed/PeerTube, which take a full URL.)
       GTS_STORAGE_BACKEND: ${GOTOSOCIAL_STORAGE_BACKEND:-local}
-      GTS_STORAGE_S3_ENDPOINT: ${GARAGE_MAGIC_NAME}.${TS_TAILNET}:3900
+      # GARAGE_S3_ENDPOINT_NAME defaults to the single node; point it at the
+      # reverse-proxy host for the HA S3 load-balancer (README "Highly
+      # available S3 endpoint").
+      GTS_STORAGE_S3_ENDPOINT: ${GARAGE_S3_ENDPOINT_NAME:-garage}.${TS_TAILNET}:3900
       GTS_STORAGE_S3_USE_SSL: "false"
-      GTS_STORAGE_S3_ACCESS_KEY: ${GARAGE_ACCESS_KEY_ID:-}
-      GTS_STORAGE_S3_SECRET_KEY: ${GARAGE_SECRET_ACCESS_KEY:-}
+      GTS_STORAGE_S3_ACCESS_KEY: ${GOTOSOCIAL_GARAGE_KEY_ID:-}
+      GTS_STORAGE_S3_SECRET_KEY: ${GOTOSOCIAL_GARAGE_KEY_SECRET:-}
       GTS_STORAGE_S3_BUCKET: ${GOTOSOCIAL_S3_BUCKET:-gotosocial-media}
       GTS_STORAGE_S3_REGION: ${GARAGE_REGION:-garage}
       # auto → path-style for non-AWS endpoints (correct for Garage).

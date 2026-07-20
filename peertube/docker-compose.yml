@@ -83,6 +83,10 @@ services:
       # ---- Redis ----
       PEERTUBE_REDIS_HOSTNAME: ${REDIS_MAGIC_NAME}.${TS_TAILNET}
       PEERTUBE_REDIS_PORT: "6379"
+      # PeerTube supports password-only Redis auth (no ACL username) —
+      # one of the reasons the stack uses a shared apps password rather
+      # than per-app Redis ACL users; see shared-db/docker-compose.yml.
+      PEERTUBE_REDIS_AUTH: ${REDIS_APPS_PASSWORD}
 
       # ---- Admin + secrets ----
       PEERTUBE_ADMIN_EMAIL: ${PEERTUBE_ADMIN_EMAIL}
@@ -101,10 +105,11 @@ services:
       PEERTUBE_SMTP_TLS: ${PEERTUBE_SMTP_TLS:-false}
 
       # ---- Live streaming (RTMP) ----
-      # Bound to 0.0.0.0 inside the sidecar netns. The netns only has lo
-      # and tailscale0 — there is no host or bridge interface to leak onto.
-      # Public ingest requires an explicit nginx stream-proxy (see
-      # nginx/sites-available/peertube-rtmp.conf).
+      # Bound to 0.0.0.0 inside the sidecar netns. Not reachable from the
+      # internet or LAN (no ports:, no DNAT); the netns' compose-bridge side
+      # is reachable only from the host / same-project containers
+      # (SECURITY.md §1.1). Public ingest requires an explicit nginx
+      # stream-proxy (see nginx/sites-available/peertube-rtmp.conf).
       PEERTUBE_LIVE_ENABLED: "true"
       PEERTUBE_LIVE_RTMP_ENABLED: "true"
       PEERTUBE_LIVE_RTMP_PORT: "1935"
@@ -130,11 +135,12 @@ services:
       PEERTUBE_OBJECT_STORAGE_REGION: ${PEERTUBE_OBJECT_STORAGE_REGION:-us-east-1}
       PEERTUBE_OBJECT_STORAGE_UPLOAD_ACL_PUBLIC: ${PEERTUBE_OBJECT_STORAGE_UPLOAD_ACL_PUBLIC:-public-read}
       PEERTUBE_OBJECT_STORAGE_UPLOAD_ACL_PRIVATE: ${PEERTUBE_OBJECT_STORAGE_UPLOAD_ACL_PRIVATE:-private}
-      # Credentials from the shared Garage key. To use a different S3 provider,
-      # set GARAGE_ACCESS_KEY_ID / GARAGE_SECRET_ACCESS_KEY to that provider's
-      # credentials, or edit these lines directly.
-      PEERTUBE_OBJECT_STORAGE_CREDENTIALS_ACCESS_KEY_ID: ${GARAGE_ACCESS_KEY_ID:-}
-      PEERTUBE_OBJECT_STORAGE_CREDENTIALS_SECRET_ACCESS_KEY: ${GARAGE_SECRET_ACCESS_KEY:-}
+      # Per-app Garage key (provision-garage) — scoped to PeerTube's two
+      # buckets. To use a different S3 provider, set PEERTUBE_GARAGE_KEY_ID /
+      # PEERTUBE_GARAGE_KEY_SECRET to that provider's credentials, or edit
+      # these lines directly.
+      PEERTUBE_OBJECT_STORAGE_CREDENTIALS_ACCESS_KEY_ID: ${PEERTUBE_GARAGE_KEY_ID:-}
+      PEERTUBE_OBJECT_STORAGE_CREDENTIALS_SECRET_ACCESS_KEY: ${PEERTUBE_GARAGE_KEY_SECRET:-}
       PEERTUBE_OBJECT_STORAGE_WEB_VIDEOS_BUCKET_NAME: ${PEERTUBE_OBJECT_STORAGE_WEB_VIDEOS_BUCKET:-}
       PEERTUBE_OBJECT_STORAGE_WEB_VIDEOS_PREFIX: ${PEERTUBE_OBJECT_STORAGE_WEB_VIDEOS_PREFIX:-}
       PEERTUBE_OBJECT_STORAGE_WEB_VIDEOS_BASE_URL: ${PEERTUBE_OBJECT_STORAGE_WEB_VIDEOS_BASE_URL:-}

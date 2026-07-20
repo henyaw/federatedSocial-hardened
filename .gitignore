@@ -37,6 +37,11 @@ authelia/configuration.runtime.yml.bak-*
 # Edit lemmy/lemmy.hjson (the tracked template), not this file.
 lemmy/lemmy.runtime.hjson
 
+# Generated at runtime by bootstrap.sh — rebuilt on 'up pg-router' and on
+# 'pg-failover'. Edit pg-router/nginx.conf (the tracked template), not this.
+pg-router/nginx.runtime.conf
+pg-router/.env
+
 # Operator-generated secrets — never commit.
 authelia/private.pem
 # Operator-managed user database with hashed passwords — gitignored so

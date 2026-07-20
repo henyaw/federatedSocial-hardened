@@ -41,7 +41,7 @@ ENV_FILE="${REPO_ROOT}/.env"
 # Operator-local log directory. Rootless by design: things like the pg-backup
 # cron log here instead of /var/log, so an unprivileged shell account works.
 mkdir -p "${REPO_ROOT}/log"
-ALL_STACKS=(shared-db garage pixelfed mastodon diaspora funkwhale gotosocial peertube stalwart authelia lemmy)
+ALL_STACKS=(shared-db garage pixelfed mastodon diaspora funkwhale gotosocial peertube stalwart authelia lemmy pg-router)
 # Stacks that need a Postgres DB provisioned before starting.
 DB_STACKS=(pixelfed mastodon diaspora funkwhale gotosocial peertube stalwart authelia lemmy)
 
@@ -211,40 +211,119 @@ cmd_provision_garage() {
 
   echo "[bootstrap] Checking Garage cluster layout..."
 
-  local layout_version
-  # Garage v1.0.x prints: ==== CURRENT CLUSTER LAYOUT (version N) ====
-  # Extract the number from that line, case-insensitively.
-  layout_version=$(_g layout show 2>/dev/null \
-    | grep -i "CURRENT CLUSTER LAYOUT" \
-    | grep -oE '[0-9]+' \
-    | head -1 || echo "0")
-  # Treat empty (no output / Garage not yet init'd) as 0.
-  [[ -n "$layout_version" ]] || layout_version="0"
+  local rf="${GARAGE_REPLICATION_FACTOR:-1}"
+  [[ "$rf" =~ ^[0-9]+$ ]] || die "GARAGE_REPLICATION_FACTOR must be a positive integer (got '${rf}')."
 
-  if [[ "$layout_version" == "0" ]]; then
-    echo "[bootstrap] Initializing cluster layout (zone=${GARAGE_ZONE:-dc1}, capacity=${GARAGE_CAPACITY:-100G})..."
-    # Run node id without stderr suppression so errors are visible.
-    local node_id_raw node_id
-    node_id_raw=$(_g node id || true)
-    node_id=$(echo "$node_id_raw" | head -1 | cut -d@ -f1)
-    if [[ -z "$node_id" ]]; then
-      echo "[bootstrap] 'garage node id' output: ${node_id_raw:-<empty>}" >&2
-      die "Could not get Garage node ID. Check: ./bootstrap.sh logs garage garage"
+  # Garage v1.0.x prints: ==== CURRENT CLUSTER LAYOUT (version N) ====
+  _garage_layout_version() {
+    _g layout show 2>/dev/null \
+      | grep -i "CURRENT CLUSTER LAYOUT" | grep -oE '[0-9]+' | head -1
+  }
+  # Zone for a node name: from GARAGE_CLUSTER_ZONES ("name:zone name:zone ...");
+  # default is the node's own name, so each node is its own failure domain.
+  _garage_zone_for() {
+    local want="$1" entry
+    for entry in ${GARAGE_CLUSTER_ZONES:-}; do
+      [[ "${entry%%:*}" == "$want" ]] && { echo "${entry#*:}"; return; }
+    done
+    echo "$want"
+  }
+
+  if [[ "$rf" -gt 1 ]]; then
+    # ---- Multi-node cluster layout ----------------------------------------
+    [[ -n "${GARAGE_BOOTSTRAP_PEERS:-}" ]] || \
+      die "Cluster mode (GARAGE_REPLICATION_FACTOR=${rf}) needs GARAGE_BOOTSTRAP_PEERS in .env.
+  Boot every node once ('./bootstrap.sh up garage' per host), run
+  './bootstrap.sh garage-peer-id' on each, set the combined comma-separated
+  list as GARAGE_BOOTSTRAP_PEERS in every host's .env, re-run 'up garage',
+  then run this command once."
+
+    local _peers=() _p
+    IFS=',' read -ra _peers <<< "${GARAGE_BOOTSTRAP_PEERS}"
+    local _clean=()
+    for _p in "${_peers[@]}"; do _p="$(echo "$_p" | xargs)"; [[ -n "$_p" ]] && _clean+=("$_p"); done
+    _peers=("${_clean[@]}")
+    local _n=${#_peers[@]}
+    [[ "$_n" -ge "$rf" ]] || \
+      die "GARAGE_BOOTSTRAP_PEERS lists ${_n} node(s) but replication_factor is ${rf} (need >= ${rf})."
+
+    echo "[bootstrap] Cluster mode: ${_n} nodes, replication_factor ${rf}."
+    # Connect to every peer (idempotent — bootstrap_peers usually did this).
+    for _p in "${_peers[@]}"; do _g node connect "$_p" >/dev/null 2>&1 || true; done
+
+    # Wait until all N nodes are visible in the cluster.
+    echo "[bootstrap] Waiting for all ${_n} nodes to connect (up to 120s)..."
+    local _elapsed=0 _interval=5 _timeout=120 _seen=0
+    while true; do
+      _seen=$(_g status 2>/dev/null | grep -icE '^[[:space:]]*[0-9a-f]{6,}@?' || true)
+      [[ "${_seen:-0}" -ge "$_n" ]] && break
+      _elapsed=$(( _elapsed + _interval ))
+      if [[ $_elapsed -ge $_timeout ]]; then
+        die "Only ${_seen}/${_n} Garage nodes connected after ${_timeout}s.
+  - Is every node up?           ./bootstrap.sh ps garage   (on each host)
+  - Same GARAGE_BOOTSTRAP_PEERS on every host's .env?
+  - ACL grants tag:garage -> tag:garage:3901?"
+      fi
+      sleep "$_interval"
+    done
+    echo "[bootstrap] All ${_n} nodes connected."
+
+    # Stage a role for every node: pubkey from the peer string, zone from
+    # GARAGE_CLUSTER_ZONES (default = node name), capacity shared. Assigning
+    # an unchanged role is a no-op, so this is safe to re-run.
+    local _pk _name _zone
+    for _p in "${_peers[@]}"; do
+      _pk="${_p%%@*}"
+      _name="${_p#*@}"; _name="${_name%%.*}"; _name="${_name%%:*}"
+      _zone="$(_garage_zone_for "$_name")"
+      echo "[bootstrap]   assign ${_name} (zone=${_zone}, capacity=${GARAGE_CAPACITY:-100G})"
+      _g layout assign "$_pk" -z "$_zone" -c "${GARAGE_CAPACITY:-100G}" -t "$_name" >/dev/null 2>&1 \
+        || echo "[bootstrap]     (unchanged)"
+    done
+
+    # Apply only if there are staged changes ('layout show' prints an
+    # "apply --version" hint under a STAGED section when so).
+    local _cur _next
+    _cur="$(_garage_layout_version)"; _cur="${_cur:-0}"
+    if _g layout show 2>/dev/null | grep -qiE 'staged|apply --version'; then
+      _next=$(( _cur + 1 ))
+      echo "[bootstrap] Applying layout version ${_next}..."
+      _g layout apply --version "$_next" || die "garage layout apply failed — see ./bootstrap.sh logs garage"
+      echo "[bootstrap] Layout applied (version ${_next})."
+    else
+      echo "[bootstrap] Layout already current (version ${_cur}) — no changes."
     fi
-    echo "[bootstrap] Assigning node ${node_id}..."
-    if ! _g layout assign "$node_id" \
-        --zone     "${GARAGE_ZONE:-dc1}" \
-        --capacity "${GARAGE_CAPACITY:-100G}" \
-        --tag      "${GARAGE_MAGIC_NAME:-garage}"; then
-      die "garage layout assign failed — see output above"
-    fi
-    echo "[bootstrap] Applying layout version 1..."
-    if ! _g layout apply --version 1; then
-      die "garage layout apply failed — see output above"
-    fi
-    echo "[bootstrap] Layout applied (version 1)."
   else
-    echo "[bootstrap] Layout already at version ${layout_version} — skipping."
+    # ---- Single-node layout (unchanged behaviour) -------------------------
+    local layout_version
+    layout_version="$(_garage_layout_version)"
+    [[ -n "$layout_version" ]] || layout_version="0"
+
+    if [[ "$layout_version" == "0" ]]; then
+      echo "[bootstrap] Initializing cluster layout (zone=${GARAGE_ZONE:-dc1}, capacity=${GARAGE_CAPACITY:-100G})..."
+      # Run node id without stderr suppression so errors are visible.
+      local node_id_raw node_id
+      node_id_raw=$(_g node id || true)
+      node_id=$(echo "$node_id_raw" | head -1 | cut -d@ -f1)
+      if [[ -z "$node_id" ]]; then
+        echo "[bootstrap] 'garage node id' output: ${node_id_raw:-<empty>}" >&2
+        die "Could not get Garage node ID. Check: ./bootstrap.sh logs garage garage"
+      fi
+      echo "[bootstrap] Assigning node ${node_id}..."
+      if ! _g layout assign "$node_id" \
+          --zone     "${GARAGE_ZONE:-dc1}" \
+          --capacity "${GARAGE_CAPACITY:-100G}" \
+          --tag      "${GARAGE_MAGIC_NAME:-garage}"; then
+        die "garage layout assign failed — see output above"
+      fi
+      echo "[bootstrap] Applying layout version 1..."
+      if ! _g layout apply --version 1; then
+        die "garage layout apply failed — see output above"
+      fi
+      echo "[bootstrap] Layout applied (version 1)."
+    else
+      echo "[bootstrap] Layout already at version ${layout_version} — skipping."
+    fi
   fi
 
   echo "[bootstrap] Ensuring buckets..."
@@ -257,30 +336,78 @@ cmd_provision_garage() {
     fi
   done
 
-  echo "[bootstrap] Ensuring access key 'federated-social-apps'..."
+  # Per-app access keys — each key can read/write ONLY its own app's
+  # buckets (SECURITY.md §5.7). The private stalwart-mail bucket is on a
+  # key only Stalwart holds; pg-backups likewise for the backup tooling.
+  # A compromised app tier can no longer read other apps' media or the
+  # mail store with its S3 credentials.
+  _key_env_prefix() {
+    case "$1" in
+      garage-pixelfed)   echo "PIXELFED_GARAGE_KEY" ;;
+      garage-mastodon)   echo "MASTODON_GARAGE_KEY" ;;
+      garage-gotosocial) echo "GOTOSOCIAL_GARAGE_KEY" ;;
+      garage-funkwhale)  echo "FUNKWHALE_GARAGE_KEY" ;;
+      garage-peertube)   echo "PEERTUBE_GARAGE_KEY" ;;
+      garage-lemmy)      echo "LEMMY_GARAGE_KEY" ;;
+      garage-stalwart)   echo "STALWART_GARAGE_KEY" ;;
+      garage-pg-backup)  echo "PG_BACKUP_GARAGE_KEY" ;;
+    esac
+  }
+  _key_buckets() {
+    case "$1" in
+      garage-pixelfed)   echo "pixelfed-media" ;;
+      garage-mastodon)   echo "mastodon-media" ;;
+      garage-gotosocial) echo "gotosocial-media" ;;
+      garage-funkwhale)  echo "funkwhale-music" ;;
+      garage-peertube)   echo "peertube-web-videos peertube-streaming-playlists" ;;
+      garage-lemmy)      echo "lemmy-pictrs" ;;
+      garage-stalwart)   echo "stalwart-mail" ;;
+      garage-pg-backup)  echo "pg-backups" ;;
+    esac
+  }
+  local key_labels=(garage-pixelfed garage-mastodon garage-gotosocial
+                    garage-funkwhale garage-peertube garage-lemmy
+                    garage-stalwart garage-pg-backup)
+
+  echo "[bootstrap] Ensuring per-app access keys..."
   # Garage allows multiple keys with the same label, so 'key create' always
   # succeeds and mints a new key. Check the key list first.
-  local key_id key_output
-  key_id=$(_g key list 2>/dev/null \
-    | awk '/federated-social-apps/ {print $1; exit}' || true)
-
-  if [[ -n "$key_id" ]]; then
-    echo "[bootstrap] Key exists (ID: ${key_id})."
-    echo "[bootstrap] Secret key is not redisplayable after creation."
-    echo "[bootstrap] If you have lost it, rotate it:"
-    echo "[bootstrap]   docker exec <garage-container> /garage key rotate ${key_id}"
-    echo "[bootstrap]   then re-run: ./bootstrap.sh provision-garage"
-    key_output=$(_g key info "$key_id" 2>/dev/null || true)
-  else
-    key_output=$(_g key create federated-social-apps 2>&1) \
-      || die "Failed to create Garage access key: ${key_output}"
-    echo "[bootstrap] Key created."
-  fi
-
-  echo "[bootstrap] Granting key access to all buckets..."
-  for bucket in "${buckets[@]}"; do
-    _g bucket allow "$bucket" --read --write --owner --key federated-social-apps 2>/dev/null || true
+  local new_env_lines=() kept_keys=() label prefix key_id key_output secret_key b
+  for label in "${key_labels[@]}"; do
+    prefix=$(_key_env_prefix "$label")
+    key_id=$(_g key list 2>/dev/null \
+      | awk -v l="$label" 'index($0, l) {print $1; exit}' || true)
+    if [[ -n "$key_id" ]]; then
+      echo "[bootstrap]   exists:  ${label} (ID: ${key_id})"
+      kept_keys+=("${label} ${key_id}")
+    else
+      key_output=$(_g key create "$label" 2>&1) \
+        || die "Failed to create Garage access key ${label}: ${key_output}"
+      key_id=$(echo "$key_output" | grep -i "Key ID" | awk '{print $NF}')
+      secret_key=$(echo "$key_output" | grep -i "Secret key" | awk '{print $NF}')
+      [[ -n "$key_id" && -n "$secret_key" ]] \
+        || die "Could not parse key create output for ${label}: ${key_output}"
+      echo "[bootstrap]   created: ${label} (ID: ${key_id})"
+      new_env_lines+=("${prefix}_ID=${key_id}" "${prefix}_SECRET=${secret_key}")
+    fi
+    # (Re-)grant the key's own buckets — idempotent, and nothing else.
+    for b in $(_key_buckets "$label"); do
+      _g bucket allow "$b" --read --write --owner --key "$label" 2>/dev/null || true
+    done
   done
+
+  # Pre-split legacy shared key: warn so it gets retired once apps are on
+  # their per-app keys. It holds read/write/owner on every bucket.
+  local legacy_key_id
+  legacy_key_id=$(_g key list 2>/dev/null \
+    | awk '/federated-social-apps/ {print $1; exit}' || true)
+  if [[ -n "$legacy_key_id" ]]; then
+    echo "[bootstrap] NOTE: legacy shared key 'federated-social-apps' (${legacy_key_id})"
+    echo "[bootstrap]   still exists and can reach EVERY bucket. After moving all"
+    echo "[bootstrap]   apps to the per-app keys above (and a successful pg-backup"
+    echo "[bootstrap]   run), delete it:"
+    echo "[bootstrap]     docker exec ${container} /garage key delete --yes ${legacy_key_id}"
+  fi
 
   # Enable website serving on public media buckets.
   #
@@ -321,13 +448,13 @@ cmd_provision_garage() {
   local s3ep="http://${GARAGE_MAGIC_NAME}.${TS_TAILNET}:3900"
   local cors_json='{"CORSRules":[{"AllowedOrigins":["*"],"AllowedMethods":["GET","HEAD"],"AllowedHeaders":["*"],"ExposeHeaders":["Content-Length","Content-Range","Accept-Ranges"],"MaxAgeSeconds":86400}]}'
   echo "[bootstrap] Setting CORS on HLS (PeerTube) buckets..."
-  if [[ -z "${GARAGE_SECRET_ACCESS_KEY:-}" ]]; then
-    echo "[bootstrap]   skipped — GARAGE_SECRET_ACCESS_KEY not in .env yet."
+  if [[ -z "${PEERTUBE_GARAGE_KEY_SECRET:-}" ]]; then
+    echo "[bootstrap]   skipped — PEERTUBE_GARAGE_KEY_SECRET not in .env yet."
     echo "[bootstrap]   Add the key printed below to .env, then re-run provision-garage."
   elif command -v aws >/dev/null 2>&1; then
     local cf; cf=$(mktemp); printf '%s' "$cors_json" >"$cf"
     for bucket in "${hls_buckets[@]}"; do
-      if AWS_ACCESS_KEY_ID="${GARAGE_ACCESS_KEY_ID}" AWS_SECRET_ACCESS_KEY="${GARAGE_SECRET_ACCESS_KEY}" \
+      if AWS_ACCESS_KEY_ID="${PEERTUBE_GARAGE_KEY_ID}" AWS_SECRET_ACCESS_KEY="${PEERTUBE_GARAGE_KEY_SECRET}" \
          aws --endpoint-url "$s3ep" --region "${GARAGE_REGION:-garage}" \
          s3api put-bucket-cors --bucket "$bucket" --cors-configuration "file://${cf}" 2>/dev/null; then
         echo "[bootstrap]   CORS set: ${bucket}"
@@ -345,32 +472,48 @@ cmd_provision_garage() {
     done
   fi
 
-  local secret_key
-  # 'key create' output includes "Secret key: <value>"; 'key info' does not.
-  secret_key=$(echo "$key_output" | grep -i "Secret key" | awk '{print $NF}')
-  # key_id was set above from 'key list' (existing) or parsed from create output.
-  [[ -n "$key_id" ]] || key_id=$(echo "$key_output" | grep -i "Key ID" | awk '{print $NF}')
-
   echo ""
   echo "[bootstrap] ============================================================"
-  if [[ -n "$secret_key" ]]; then
-    echo "[bootstrap] Add these to your .env:"
+  if [[ ${#new_env_lines[@]} -gt 0 ]]; then
+    echo "[bootstrap] Newly created keys — add these to your .env (secrets are"
+    echo "[bootstrap] NOT redisplayable later):"
     echo ""
-    echo "  GARAGE_ACCESS_KEY_ID=${key_id}"
-    echo "  GARAGE_SECRET_ACCESS_KEY=${secret_key}"
+    local line
+    for line in "${new_env_lines[@]}"; do
+      echo "  ${line}"
+    done
     echo ""
     echo "[bootstrap] Then opt in apps via .env and restart their stacks"
     echo "[bootstrap] (./bootstrap.sh restart <app> — never 'docker compose restart'):"
     echo "  MASTODON_S3_ENABLED=true"
     echo "  PIXELFED_ENABLE_CLOUD=true"
     echo "  PEERTUBE_OBJECT_STORAGE_ENABLED=true"
-  else
-    echo "[bootstrap] Key already existed — secret not redisplayable."
-    [[ -n "$key_id" ]] && echo "  GARAGE_ACCESS_KEY_ID=${key_id}"
-    echo "[bootstrap] To rotate: /garage key rotate ${key_id:-<key-id>}"
-    echo "[bootstrap]   then re-run: ./bootstrap.sh provision-garage"
+  fi
+  if [[ ${#kept_keys[@]} -gt 0 ]]; then
+    echo "[bootstrap] Pre-existing keys (secrets not redisplayable). If a secret"
+    echo "[bootstrap] is lost, rotate the key and re-run provision-garage:"
+    local kept
+    for kept in "${kept_keys[@]}"; do
+      echo "  ${kept%% *}  (docker exec ${container} /garage key rotate ${kept##* })"
+    done
   fi
   echo "[bootstrap] ============================================================"
+}
+
+# Print this host's Garage peer id: <node-pubkey>@<magicdns-name>:3901.
+# Collect one from each node to assemble GARAGE_BOOTSTRAP_PEERS (comma-joined)
+# for a multi-node cluster. Uses the stable MagicDNS name, never the tailnet
+# IP (ephemeral sidecars change IP on restart; the name is stable).
+cmd_garage_peer_id() {
+  local container
+  container=$(dc garage ps -q garage 2>/dev/null | head -1)
+  [[ -n "$container" ]] || die "Garage is not running on this host. Start it: ./bootstrap.sh up garage"
+  [[ -n "${GARAGE_MAGIC_NAME:-}" && -n "${TS_TAILNET:-}" ]] || \
+    die "GARAGE_MAGIC_NAME and TS_TAILNET must be set in .env."
+  local pubkey
+  pubkey=$(docker exec "$container" /garage node id 2>/dev/null | head -1 | cut -d@ -f1)
+  [[ -n "$pubkey" ]] || die "Could not read this node's Garage id. Check: ./bootstrap.sh logs garage"
+  echo "${pubkey}@${GARAGE_MAGIC_NAME}.${TS_TAILNET}:3901"
 }
 
 # ---------------------------------------------------------------------------
@@ -468,8 +611,9 @@ cmd_provision_stalwart() {
   local missing=()
   for v in STALWART_MAGIC_NAME TS_TAILNET STALWART_DOMAIN STALWART_HOSTNAME \
             STALWART_FALLBACK_ADMIN_SECRET STALWART_REDIS_DB \
-            REDIS_MAGIC_NAME GARAGE_MAGIC_NAME GARAGE_REGION \
-            GARAGE_ACCESS_KEY_ID GARAGE_SECRET_ACCESS_KEY \
+            REDIS_MAGIC_NAME REDIS_APPS_PASSWORD \
+            GARAGE_MAGIC_NAME GARAGE_REGION \
+            STALWART_GARAGE_KEY_ID STALWART_GARAGE_KEY_SECRET \
             STALWART_S3_BUCKET STALWART_RELAY_USER STALWART_RELAY_PASSWORD; do
     [[ -n "${!v:-}" ]] || missing+=("$v")
   done
@@ -498,13 +642,16 @@ cmd_provision_stalwart() {
   _sw_get_acct_id
 
   # ── Blob store → Garage S3 ────────────────────────────────────────────────
+  # GARAGE_S3_ENDPOINT_NAME defaults to the single node; set it to the
+  # reverse-proxy host for the HA S3 load-balancer (README "Highly available
+  # S3 endpoint").
   echo "[bootstrap] Setting blob store (Garage S3, bucket ${STALWART_S3_BUCKET})..."
   _sw_ok "$(_sw_call "$(jq -nc \
-    --arg ep     "http://${GARAGE_MAGIC_NAME}.${TS_TAILNET}:3900" \
+    --arg ep     "http://${GARAGE_S3_ENDPOINT_NAME:-garage}.${TS_TAILNET}:3900" \
     --arg region "${GARAGE_REGION}" \
     --arg bucket "${STALWART_S3_BUCKET}" \
-    --arg ak     "${GARAGE_ACCESS_KEY_ID}" \
-    --arg sk     "${GARAGE_SECRET_ACCESS_KEY}" \
+    --arg ak     "${STALWART_GARAGE_KEY_ID}" \
+    --arg sk     "${STALWART_GARAGE_KEY_SECRET}" \
     --arg acct   "$_SW_ACCT_ID" \
     '[["x:BlobStore/set",{"accountId":$acct,"update":{"singleton":{
       "@type":"S3",
@@ -516,9 +663,11 @@ cmd_provision_stalwart() {
     }}},"0"]]')")"
 
   # ── In-memory store → Redis ───────────────────────────────────────────────
+  # Default-user auth on the main Redis instance. REDIS_APPS_PASSWORD must be
+  # URL-safe (openssl rand -hex 32) — it is embedded in the connection URL.
   echo "[bootstrap] Setting in-memory store (Redis db ${STALWART_REDIS_DB})..."
   _sw_ok "$(_sw_call "$(jq -nc \
-    --arg url  "redis://${REDIS_MAGIC_NAME}.${TS_TAILNET}:6379/${STALWART_REDIS_DB}" \
+    --arg url  "redis://:${REDIS_APPS_PASSWORD}@${REDIS_MAGIC_NAME}.${TS_TAILNET}:6379/${STALWART_REDIS_DB}" \
     --arg acct "$_SW_ACCT_ID" \
     '[["x:InMemoryStore/set",{"accountId":$acct,"update":{"singleton":{
       "@type":"Redis",
@@ -750,6 +899,139 @@ _cmd_up_caddy() {
   echo "[bootstrap] Caddy reloaded. Check: sudo journalctl -u caddy -n 50"
 }
 
+# ---------------------------------------------------------------------------
+# Postgres high availability (see README "Postgres high availability")
+# ---------------------------------------------------------------------------
+
+# Ensure the replication role + physical slot on the PRIMARY. Idempotent.
+_pg_ensure_replication() {
+  : "${REPLICATION_PASSWORD:?REPLICATION_PASSWORD must be set in .env}"
+  local user="${REPLICATION_USER:-replicator}" slot="${PG_REPLICATION_SLOT:-standby_slot}"
+  echo "[bootstrap] Ensuring replication role '${user}' and slot '${slot}'..."
+  _pg_exec --dbname postgres <<SQL
+DO \$\$
+BEGIN
+  IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '${user}') THEN
+    CREATE ROLE "${user}" WITH REPLICATION LOGIN PASSWORD '${REPLICATION_PASSWORD}';
+  ELSE
+    ALTER ROLE "${user}" WITH REPLICATION LOGIN PASSWORD '${REPLICATION_PASSWORD}';
+  END IF;
+END
+\$\$;
+SELECT pg_create_physical_replication_slot('${slot}')
+WHERE NOT EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name = '${slot}');
+SQL
+  echo "[bootstrap] Replication role + slot ready."
+}
+
+# Bring up shared-db as a standby: Postgres only (no Redis), cloning from the
+# primary on first boot via the pg-entrypoint wrapper.
+_cmd_up_pg_standby() {
+  local missing=()
+  for v in PG_NODE_MAGIC_NAME PG_PRIMARY_MAGIC_NAME TS_TAILNET REPLICATION_PASSWORD; do
+    [[ -n "${!v:-}" ]] || missing+=("$v")
+  done
+  [[ ${#missing[@]} -eq 0 ]] || die "shared-db standby needs these in .env: ${missing[*]}
+  PG_ROLE=standby; PG_NODE_MAGIC_NAME=this node (e.g. pg-standby);
+  PG_PRIMARY_MAGIC_NAME=the primary (e.g. pg-primary)."
+
+  echo "[bootstrap] shared-db STANDBY: Postgres only (no Redis)."
+  echo "[bootstrap]   this node = ${PG_NODE_MAGIC_NAME}, primary = ${PG_PRIMARY_MAGIC_NAME}"
+
+  echo "[bootstrap] Starting ts-postgres sidecar..."
+  if ! dc shared-db up -d ts-postgres; then _check_ts_auth shared-db; exit 1; fi
+
+  echo "[bootstrap] Starting Postgres standby (clones from the primary on first boot)..."
+  if ! dc shared-db up -d postgres; then
+    echo "[bootstrap] Standby failed to start. Common causes:" >&2
+    echo "[bootstrap]   - primary not reachable at ${PG_PRIMARY_MAGIC_NAME}.${TS_TAILNET}:5432" >&2
+    echo "[bootstrap]   - replication role/slot missing on primary ('up shared-db' there first)" >&2
+    echo "[bootstrap]   - ACL missing tag:db-postgres -> tag:db-postgres:5432" >&2
+    echo "[bootstrap]   Logs: ./bootstrap.sh logs shared-db postgres" >&2
+    exit 1
+  fi
+  echo "[bootstrap] Standby up. Confirm streaming ON THE PRIMARY:"
+  echo "[bootstrap]   docker exec <primary-pg> psql -U postgres -c 'SELECT client_addr,state FROM pg_stat_replication;'"
+}
+
+# Generate the pg-router nginx config from the current primary and (re)start it.
+# Also the failover repoint step: change PG_PRIMARY_MAGIC_NAME, re-run this.
+_cmd_up_pg_router() {
+  local missing=()
+  for v in DB_MAGIC_NAME PG_PRIMARY_MAGIC_NAME TS_TAILNET; do
+    [[ -n "${!v:-}" ]] || missing+=("$v")
+  done
+  [[ ${#missing[@]} -eq 0 ]] || die "pg-router needs these in .env: ${missing[*]}
+  DB_MAGIC_NAME = the app-facing endpoint apps already dial;
+  PG_PRIMARY_MAGIC_NAME = the CURRENT primary node (e.g. pg-primary)."
+
+  local addr="${PG_PRIMARY_MAGIC_NAME}.${TS_TAILNET}:5432"
+  sed "s|__PG_PRIMARY_ADDR__|${addr}|" \
+    "${REPO_ROOT}/pg-router/nginx.conf" > "${REPO_ROOT}/pg-router/nginx.runtime.conf"
+  echo "[bootstrap] Generated pg-router/nginx.runtime.conf (${DB_MAGIC_NAME} -> ${addr})."
+
+  echo "[bootstrap] Starting pg-router..."
+  if ! dc pg-router up -d; then _check_ts_auth pg-router; exit 1; fi
+  # If only the mounted config changed (failover repoint), 'up -d' won't
+  # recreate the container — reload nginx so it re-reads the new upstream.
+  local rc; rc=$(dc pg-router ps -q pg-router 2>/dev/null | head -1)
+  [[ -n "$rc" ]] && docker exec "$rc" nginx -s reload >/dev/null 2>&1 || true
+  echo "[bootstrap] pg-router up. Apps reach ${DB_MAGIC_NAME}.${TS_TAILNET}:5432 -> ${PG_PRIMARY_MAGIC_NAME}."
+}
+
+# Promote this standby to primary (run ON THE STANDBY host during a failover).
+cmd_pg_promote() {
+  [[ "${PG_ROLE:-primary}" == "standby" ]] || \
+    die "Run this on the STANDBY host (PG_ROLE=standby). This host is '${PG_ROLE:-primary}'."
+  local c; c=$(dc shared-db ps -q postgres 2>/dev/null | head -1)
+  [[ -n "$c" ]] || die "Postgres standby not running here. ./bootstrap.sh up shared-db"
+  if ! docker exec "$c" psql -U postgres -tAc "SELECT pg_is_in_recovery();" 2>/dev/null | grep -qi '^t'; then
+    die "This Postgres is NOT in recovery (already a primary?). Refusing to promote."
+  fi
+  echo "[bootstrap] Promoting this standby to primary..."
+  docker exec "$c" psql -U postgres -c "SELECT pg_promote(wait => true);" \
+    || die "pg_promote failed — see ./bootstrap.sh logs shared-db postgres"
+  echo "[bootstrap] Promoted. This node (${PG_NODE_MAGIC_NAME:-this host}) is now PRIMARY."
+  echo "[bootstrap]"
+  echo "[bootstrap] FINISH FAILOVER — on the pg-router host:"
+  echo "[bootstrap]   1. set PG_PRIMARY_MAGIC_NAME=${PG_NODE_MAGIC_NAME:-<this node>} in its .env"
+  echo "[bootstrap]   2. ./bootstrap.sh up pg-router     # repoints apps at the new primary"
+  echo "[bootstrap]   3. set PG_ROLE=primary in THIS host's .env (tidy-up for restarts)"
+  echo "[bootstrap] When the old primary's host returns, re-clone it as the new standby:"
+  echo "[bootstrap]   ./bootstrap.sh pg-rejoin        (on that host)"
+}
+
+# Re-clone THIS host as a fresh standby of the current primary. Destructive.
+cmd_pg_rejoin() {
+  [[ "${PG_ROLE:-primary}" == "standby" ]] || \
+    die "Set PG_ROLE=standby in this host's .env first (it is rejoining as the new standby)."
+  local missing=()
+  for v in PG_NODE_MAGIC_NAME PG_PRIMARY_MAGIC_NAME TS_TAILNET REPLICATION_PASSWORD; do
+    [[ -n "${!v:-}" ]] || missing+=("$v")
+  done
+  [[ ${#missing[@]} -eq 0 ]] || die "pg-rejoin needs these in .env: ${missing[*]}"
+
+  echo "[bootstrap] pg-rejoin: re-clone THIS host as a fresh standby of ${PG_PRIMARY_MAGIC_NAME}."
+  echo "[bootstrap] This DESTROYS this host's local Postgres data volume and streams a clean"
+  echo "[bootstrap] copy from the current primary. Use it on a FORMER primary that came back"
+  echo "[bootstrap] after a failover. (pg_rewind is faster but needs wal_log_hints/checksums;"
+  echo "[bootstrap] a full re-clone always works and is fine for a rare event.)"
+  local ans
+  read -r -p "  Type RECLONE to proceed: " ans
+  [[ "$ans" == "RECLONE" ]] || die "Aborted."
+
+  echo "[bootstrap] Stopping shared-db and removing the pg-data volume..."
+  dc shared-db down
+  local vol
+  vol=$(docker volume ls -q | grep -E 'shared-db_pg-data$' | head -1)
+  if [[ -n "$vol" ]]; then
+    docker volume rm "$vol" >/dev/null 2>&1 && echo "[bootstrap]   removed volume ${vol}"
+  else
+    echo "[bootstrap]   (no pg-data volume found — cloning fresh)"
+  fi
+  _cmd_up_pg_standby
+}
+
 cmd_up() {
   local stack="${1:-}"
   [[ -n "$stack" ]] || die "Usage: ./bootstrap.sh up <stack>"
@@ -770,6 +1052,30 @@ cmd_up() {
     echo "[bootstrap] Created ${stack}/.env -> ../.env"
   fi
 
+  # pg-router (HA Postgres endpoint): generate the runtime nginx config from
+  # the current primary, then bring the small proxy up. Nothing else to do.
+  if [[ "$stack" == "pg-router" ]]; then
+    _cmd_up_pg_router
+    return 0
+  fi
+
+  # shared-db STANDBY: a different bring-up (Postgres only, clone from the
+  # primary — no Redis, no app-DB provisioning). Primary falls through.
+  if [[ "$stack" == "shared-db" && "${PG_ROLE:-primary}" == "standby" ]]; then
+    _cmd_up_pg_standby
+    return 0
+  fi
+
+  # shared-db preflight: both Redis instances refuse to be brought up
+  # without their passwords — an empty ${VAR} would silently expand to
+  # `--requirepass ''`, which DISABLES Redis auth.
+  if [[ "$stack" == "shared-db" ]]; then
+    for v in REDIS_APPS_PASSWORD REDIS_AUTHELIA_PASSWORD; do
+      [[ -n "${!v:-}" ]] || \
+        die "${v} is not set in .env. Generate one: openssl rand -hex 32"
+    done
+  fi
+
   # Provision DB for app stacks (idempotent — safe on fresh or existing
   # volumes). Skip for shared-db and garage; skip gracefully if shared-db
   # isn't up yet.
@@ -786,19 +1092,49 @@ cmd_up() {
     fi
   fi
 
-  # After Garage comes up, auto-run provision-garage (idempotent).
-  # Skipped if layout is already initialized — effectively a no-op on restarts.
+  # After Garage comes up: single node self-provisions immediately; a cluster
+  # node comes up and defers layout formation to one coordinated
+  # provision-garage run (see cmd_provision_garage).
   if [[ "$stack" == "garage" ]]; then
     [[ -n "${GARAGE_RPC_SECRET:-}" ]] || \
       die "GARAGE_RPC_SECRET is not set in .env. Generate one: openssl rand -hex 32"
+
+    local rf="${GARAGE_REPLICATION_FACTOR:-1}"
+    [[ "$rf" =~ ^[0-9]+$ ]] || die "GARAGE_REPLICATION_FACTOR must be a positive integer (got '${rf}')."
 
     # Generate garage.runtime.toml from the tracked template, substituting
     # .env values for fields Garage can't read from environment variables.
     # The runtime file is gitignored; the template stays clean for git pulls.
     local region="${GARAGE_REGION:-garage}"
-    sed "s|^s3_region *=.*|s3_region     = \"${region}\"|" \
-        "${REPO_ROOT}/garage/garage.toml" > "${REPO_ROOT}/garage/garage.runtime.toml"
-    echo "[bootstrap] Generated garage.runtime.toml (s3_region=${region})."
+    local runtime="${REPO_ROOT}/garage/garage.runtime.toml"
+    sed -e "s|__GARAGE_REPLICATION_FACTOR__|${rf}|" \
+        -e "s|^s3_region *=.*|s3_region     = \"${region}\"|" \
+        "${REPO_ROOT}/garage/garage.toml" > "$runtime"
+
+    if [[ "$rf" -gt 1 ]]; then
+      # Cluster mode: advertise a STABLE rpc address (this node's MagicDNS
+      # name, never its ephemeral tailnet IP) and, once known, the peer list.
+      [[ -n "${GARAGE_MAGIC_NAME:-}" && -n "${TS_TAILNET:-}" ]] || \
+        die "Cluster mode (GARAGE_REPLICATION_FACTOR=${rf}) needs GARAGE_MAGIC_NAME and TS_TAILNET set in .env."
+      sed -i "s|__GARAGE_RPC_PUBLIC_ADDR__|rpc_public_addr = \"${GARAGE_MAGIC_NAME}.${TS_TAILNET}:3901\"|" "$runtime"
+      if [[ -n "${GARAGE_BOOTSTRAP_PEERS:-}" ]]; then
+        local _peer _peer_arr=() _peers_toml=""
+        IFS=',' read -ra _peer_arr <<< "${GARAGE_BOOTSTRAP_PEERS}"
+        for _peer in "${_peer_arr[@]}"; do
+          _peer="$(echo "$_peer" | xargs)"; [[ -n "$_peer" ]] || continue
+          _peers_toml+="\"${_peer}\", "
+        done
+        _peers_toml="${_peers_toml%, }"
+        sed -i "s|__GARAGE_BOOTSTRAP_PEERS__|bootstrap_peers = [${_peers_toml}]|" "$runtime"
+      else
+        sed -i "/__GARAGE_BOOTSTRAP_PEERS__/d" "$runtime"
+      fi
+      echo "[bootstrap] Generated garage.runtime.toml (cluster: replication_factor=${rf}, node=${GARAGE_MAGIC_NAME}, s3_region=${region})."
+    else
+      # Single node: strip the cluster-only tokens.
+      sed -i "/__GARAGE_RPC_PUBLIC_ADDR__/d; /__GARAGE_BOOTSTRAP_PEERS__/d" "$runtime"
+      echo "[bootstrap] Generated garage.runtime.toml (single-node, s3_region=${region})."
+    fi
 
     echo "[bootstrap] Starting Garage..."
     if ! dc garage up -d; then
@@ -828,7 +1164,35 @@ cmd_up() {
       sleep "$interval"
     done
 
-    cmd_provision_garage
+    if [[ "$rf" -le 1 ]]; then
+      cmd_provision_garage
+      return 0
+    fi
+
+    # Cluster node is up. Layout formation + bucket/key creation is a single
+    # coordinated step run ONCE (on any node) after every node is up — so we
+    # do NOT auto-provision here on each host.
+    local gcontainer gpubkey=""
+    gcontainer=$(dc garage ps -q garage 2>/dev/null | head -1)
+    [[ -n "$gcontainer" ]] && gpubkey=$(docker exec "$gcontainer" /garage node id 2>/dev/null | head -1 | cut -d@ -f1)
+    echo ""
+    echo "[bootstrap] Garage node '${GARAGE_MAGIC_NAME}' is up (cluster mode, replication_factor=${rf})."
+    if [[ -z "${GARAGE_BOOTSTRAP_PEERS:-}" ]]; then
+      echo "[bootstrap] ------------------------------------------------------------"
+      echo "[bootstrap] This node's peer id (for GARAGE_BOOTSTRAP_PEERS):"
+      echo ""
+      echo "    ${gpubkey}@${GARAGE_MAGIC_NAME}.${TS_TAILNET}:3901"
+      echo ""
+      echo "[bootstrap] NEXT: bring every node up once, collect all peer ids"
+      echo "[bootstrap]   (./bootstrap.sh garage-peer-id on each host), set the"
+      echo "[bootstrap]   combined comma-separated list as GARAGE_BOOTSTRAP_PEERS in"
+      echo "[bootstrap]   EVERY host's .env, then re-run 'up garage' on each host."
+      echo "[bootstrap] ------------------------------------------------------------"
+    else
+      echo "[bootstrap] Peers configured. Once ALL nodes are up, form the cluster"
+      echo "[bootstrap] and create buckets/keys by running ONCE on any node:"
+      echo "[bootstrap]     ./bootstrap.sh provision-garage"
+    fi
     return 0
   fi
 
@@ -960,6 +1324,23 @@ cmd_up() {
     exit 1
   fi
   echo "[bootstrap] ${stack} is up. Tip: ./bootstrap.sh logs ${stack}"
+
+  # Primary Postgres HA: once REPLICATION_PASSWORD is set, ensure the
+  # replication role + physical slot exist so a standby can clone and stream.
+  # No-op (skipped) for a single-node deployment that leaves it unset.
+  if [[ "$stack" == "shared-db" && -n "${REPLICATION_PASSWORD:-}" ]]; then
+    # Wait for the local Postgres socket before provisioning the role.
+    local _pgc _tries=0
+    while :; do
+      _pgc=$(dc shared-db ps -q postgres 2>/dev/null | head -1)
+      if [[ -n "$_pgc" ]] && docker exec "$_pgc" pg_isready -U postgres >/dev/null 2>&1; then
+        break
+      fi
+      _tries=$(( _tries + 1 )); [[ $_tries -ge 30 ]] && { echo "[bootstrap] Postgres not ready — skipping replication role (run 'up shared-db' again)."; break; }
+      sleep 2
+    done
+    [[ -n "$_pgc" ]] && _pg_ensure_replication
+  fi
 
   # After Stalwart comes up, auto-run provision-stalwart (idempotent).
   # This wires stores, domain, listeners, and accounts from .env — same as
@@ -1266,11 +1647,21 @@ Usage: ./bootstrap.sh <command> [args]
   ps                  [stack]               Show container status for one or all stacks
   provision-db        <app>                 Idempotent DB role + database setup
   provision-garage                          Idempotent Garage layout + bucket + key setup
+  garage-peer-id                            Print this host's Garage cluster peer id
   provision-stalwart                        Configure Stalwart via JMAP (auto-run by 'up stalwart')
+  pg-promote                                Promote this Postgres standby to primary (failover)
+  pg-rejoin                                 Re-clone this host as a fresh standby (post-failover)
   user-create         <app> <user> <email>  Create an admin user
   backup-cron                               Install the nightly pg-backup cron (interactive)
 
 Stacks: ${ALL_STACKS[*]}
+
+Postgres HA (see README "Postgres high availability"):
+  ./bootstrap.sh up shared-db          # primary: also creates the replication role/slot
+  ./bootstrap.sh up shared-db          # standby host (PG_ROLE=standby): clones + streams
+  ./bootstrap.sh up pg-router          # app-facing endpoint -> current primary
+  ./bootstrap.sh pg-promote            # on the standby, during a failover
+  ./bootstrap.sh pg-rejoin             # re-clone a returned old primary as the new standby
 
 Examples:
   ./bootstrap.sh up shared-db
@@ -1302,7 +1693,10 @@ case "$command" in
   ps)           cmd_ps "$@" ;;
   provision-db)          cmd_provision_db "$@" ;;
   provision-garage)      cmd_provision_garage ;;
+  garage-peer-id)        cmd_garage_peer_id ;;
   provision-stalwart)    cmd_provision_stalwart ;;
+  pg-promote)            cmd_pg_promote ;;
+  pg-rejoin)             cmd_pg_rejoin ;;
   user-create)           cmd_user_create "$@" ;;
   backup-cron)           cmd_backup_cron ;;
   help|--help|-h) usage ;;

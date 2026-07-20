@@ -3,23 +3,28 @@
 # All app stacks in this repo can store media here instead of local volumes,
 # making instances portable across servers and load-balancer-friendly.
 #
-# Single-node by default (replication_factor = 1 in garage.toml). To expand
-# to multiple nodes across servers or countries:
-#   1. Bring up a second Garage container with the same GARAGE_RPC_SECRET.
-#   2. Add its tailnet address to rpc_bootstrap_peers in garage.toml.
-#   3. Raise replication_factor in garage.toml and restart.
-#   4. Re-run: ./bootstrap.sh provision-garage
+# This one compose file runs a SINGLE Garage node — one per host. A cluster
+# is N hosts each running this file, joined over the tailnet. Which mode you
+# get is driven entirely by .env (nothing here changes):
+#
+#   SINGLE NODE (default): GARAGE_REPLICATION_FACTOR unset/1.
+#     ./bootstrap.sh up garage      # brings up + auto-provisions
+#
+#   THREE-NODE CLUSTER: GARAGE_REPLICATION_FACTOR=3, per-host GARAGE_MAGIC_NAME
+#   and GARAGE_ZONE, shared GARAGE_RPC_SECRET, and a shared GARAGE_BOOTSTRAP_PEERS
+#   assembled after first boot. Bring-up (see README "Multi-node Garage cluster"):
+#     1. On EACH host:  ./bootstrap.sh up garage         # boots the node
+#     2. On EACH host:  ./bootstrap.sh garage-peer-id    # collect the 3 ids
+#     3. Set GARAGE_BOOTSTRAP_PEERS (all 3, comma-joined) in every host's .env
+#     4. On EACH host:  ./bootstrap.sh up garage         # reboots with peers
+#     5. ONCE, any host: ./bootstrap.sh provision-garage # forms cluster + buckets/keys
 #
 # Bring up shared-db/ first, then garage/, then app stacks.
 #
-# First-boot operator steps (run once after `docker compose up -d`):
-#
-#   ./bootstrap.sh provision-garage
-#
-# That command initialises the cluster layout, creates all app buckets,
-# creates an access key, and prints GARAGE_ACCESS_KEY_ID +
-# GARAGE_SECRET_ACCESS_KEY — paste those into .env, then bring up app stacks.
-# Re-running is idempotent.
+# provision-garage initialises the layout, creates all app buckets, creates
+# one access key PER APP (each scoped to only its own buckets — SECURITY.md
+# §5.7), and prints the <APP>_GARAGE_KEY_ID/SECRET pairs — paste those into
+# .env, then bring up app stacks. Re-running is idempotent.
 
 name: federated-garage
 

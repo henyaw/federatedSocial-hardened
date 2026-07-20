@@ -143,7 +143,8 @@ You'll need to fill in:
 - `TS_TAILNET` — your tailnet's domain (visible in the admin console, looks like `tailfe8c.ts.net` or `yourname.ts.net`).
 - Hostnames for each service (`DB_MAGIC_NAME`, `REDIS_MAGIC_NAME`, `GARAGE_MAGIC_NAME`, etc.). These become the names your services appear under in Tailscale. Pick whatever you want; the defaults are fine.
 - Database credentials. Generate strong passwords; you won't be typing these often. (Note the comment on `FUNKWHALE_DB_PASSWORD` — use hex, not base64.)
-- `GARAGE_RPC_SECRET` if you'll run object storage (`openssl rand -hex 32`). Leave `GARAGE_ACCESS_KEY_ID`/`SECRET` blank for now — `provision-garage` fills those in.
+- `REDIS_APPS_PASSWORD` and `REDIS_AUTHELIA_PASSWORD` (`openssl rand -hex 32` each). The main Redis carries app caches/queues; a second instance holds Authelia's SSO sessions behind its own password and ACL grant so a compromised app can't touch them (see `SECURITY.md` §5.7).
+- `GARAGE_RPC_SECRET` if you'll run object storage (`openssl rand -hex 32`). Leave the `<APP>_GARAGE_KEY_ID`/`SECRET` pairs blank for now — `provision-garage` fills those in.
 - The shared `SMTP_*` relay block — see [Email (SMTP)](#email-smtp).
 - Per-app settings (domain names, app-specific secrets). Each app's section is commented.
 
@@ -170,11 +171,13 @@ If you want apps to store media in shared object storage instead of local volume
 ./bootstrap.sh up garage
 ```
 
-This brings up Garage and runs `provision-garage`, which initialises the cluster layout, creates the app buckets, and generates an access key. It prints two values:
+This single-node command brings up Garage and runs `provision-garage`, which initialises the cluster layout, creates the app buckets, and generates **one access key per app**, each able to reach only that app's buckets — a stolen Pixelfed key can't read Mastodon's media or the private mail bucket. (For a resilient three-server deployment, follow [Multi-node Garage cluster](#multi-node-garage-cluster) instead — the bring-up sequence differs.) It prints the key pairs once (secrets are not redisplayable):
 
 ```
-GARAGE_ACCESS_KEY_ID=...
-GARAGE_SECRET_ACCESS_KEY=...
+PIXELFED_GARAGE_KEY_ID=...
+PIXELFED_GARAGE_KEY_SECRET=...
+MASTODON_GARAGE_KEY_ID=...
+...
 ```
 
 Paste those into your `.env`. You can now opt any app into S3 storage by setting its flag (`MASTODON_S3_ENABLED=true`, `PIXELFED_ENABLE_CLOUD=true`, `PEERTUBE_OBJECT_STORAGE_ENABLED=true`) before bringing it up. See [Object storage](#object-storage-garage).
@@ -183,7 +186,7 @@ Paste those into your `.env`. You can now opt any app into S3 storage by setting
 
 Stalwart handles SMTP, IMAP, and JMAP for your instances. It stores its full configuration in Postgres and mail blobs in Garage — both must be up and provisioned before starting Stalwart.
 
-Fill in the Stalwart section of `.env` first (at minimum `STALWART_FALLBACK_ADMIN_SECRET`, the `STALWART_DB_*` credentials, and the Garage keys from step 6).
+Fill in the Stalwart section of `.env` first (at minimum `STALWART_FALLBACK_ADMIN_SECRET`, the `STALWART_DB_*` credentials, and the `STALWART_GARAGE_KEY_*` pair from step 6 — the only key granted the private mail bucket).
 
 ```bash
 ./bootstrap.sh up stalwart
@@ -275,7 +278,7 @@ Reload your reverse proxy and visit your domain. You should see the app.
 | Pixelfed | `PIXELFED_ENABLE_CLOUD=true` |
 | PeerTube | `PEERTUBE_OBJECT_STORAGE_ENABLED=true` |
 
-All three share the one `GARAGE_ACCESS_KEY_ID` / `GARAGE_SECRET_ACCESS_KEY` pair from `provision-garage`. Buckets are created for you (`mastodon-media`, `pixelfed-media`, `peertube-web-videos`, `peertube-streaming-playlists`, `funkwhale-music`, plus `pg-backups` for database dumps).
+Each app uses its own `<APP>_GARAGE_KEY_ID` / `<APP>_GARAGE_KEY_SECRET` pair from `provision-garage`, scoped to only that app's buckets. Buckets are created for you (`mastodon-media`, `pixelfed-media`, `peertube-web-videos`, `peertube-streaming-playlists`, `funkwhale-music`, plus `pg-backups` for database dumps).
 
 **Serving media to the public — you need a media host.** Enabling S3 changes where an app *stores* media, not how browsers *fetch* it. With cloud storage on, apps embed object URLs that point at Garage's tailnet address — specifically its **S3 API port `3900`, which only answers *signed* requests** (an anonymous browser GET gets `403 "does not support anonymous access"`). Public clients can neither reach the tailnet nor sign requests, so media silently fails to load even though uploads succeed. The fix is a small public reverse-proxy vhost that forwards to Garage's **web endpoint (`3902`)** and **rewrites the `Host` header to the bucket's web vhost** (`<bucket>.web.garage.local`) — and must *not* rewrite the path. The ready-to-uncomment config lives **next to each app's web proxy** — a commented media block at the bottom of `nginx/sites-available/<app>.conf`, and the matching block in `caddy/Caddyfile`. Then point each app at its media domain:
 
@@ -287,9 +290,75 @@ All three share the one `GARAGE_ACCESS_KEY_ID` / `GARAGE_SECRET_ACCESS_KEY` pair
 
 Each media domain maps to **exactly one bucket**, so give every app its **own** hostname (its own public DNS record + TLS cert). PeerTube is the exception — it builds public object URLs from its own `PEERTUBE_OBJECT_STORAGE_*` settings; see its `.env` block. Skip this step and you get a working upload but broken images: wrong port (3900 instead of 3902), no proxy, and a lost afternoon tracing it.
 
-**Single node vs. cluster.** Garage starts single-node (`replication_factor = 1` in `garage/garage.toml`). To add a second node on another server: bring it up with the same `GARAGE_RPC_SECRET`, add its tailnet address to `rpc_bootstrap_peers`, raise the replication factor, and re-run `provision-garage`. Two servers in two countries is exactly Garage's intended topology.
+**Single node vs. cluster.** Garage starts single-node (`GARAGE_REPLICATION_FACTOR=1`). For redundancy across servers, run the same `garage/` stack on multiple hosts and raise the replication factor — see [Multi-node Garage cluster](#multi-node-garage-cluster) below. Two (or three) servers is exactly Garage's intended topology.
 
 **Want to use an external bucket instead?** Point an app's endpoint at your provider (Backblaze B2, Wasabi, Scaleway, AWS) rather than Garage. PeerTube's `.env` section documents the per-field overrides; the same pattern applies to the others.
+
+### Multi-node Garage cluster
+
+A single Garage node is a single disk: lose it and the media is gone until you restore a backup. Running three nodes with `GARAGE_REPLICATION_FACTOR=3` keeps three copies, one per node, so the cluster tolerates losing any two nodes without data loss. The three nodes talk to each other over the tailnet using their stable MagicDNS names, so ephemeral sidecar IPs are a non-issue.
+
+**Topology.** Each of the three servers runs the `garage/` stack (one Garage node + its Tailscale sidecar), joined into one cluster. Everything else — `shared-db`, the apps, the reverse proxy — is unchanged and typically lives on your main host; the extra two servers can be Garage-only. Postgres/Redis are still single-instance (clustering them is a separate, larger step — see `CLAUDE.md`).
+
+**Prerequisites.**
+- Three hosts on the same tailnet, each with Docker and this repo checked out.
+- Each host has its **own** `.env`. These values are **shared** (identical on all three): `GARAGE_RPC_SECRET`, `GARAGE_REPLICATION_FACTOR=3`, and (after step 3) `GARAGE_BOOTSTRAP_PEERS`. These are **per-host**: `GARAGE_MAGIC_NAME` (e.g. `garage-1`/`garage-2`/`garage-3`), `GARAGE_ZONE` (e.g. `dc1`/`dc2`/`dc3` — distinct so replicas spread), and `GARAGE_CAPACITY` (that node's disk).
+- Update your Tailscale ACL from `acl.example.hujson` — it now grants `tag:garage → tag:garage:3901` (node-to-node RPC). Without it the cluster can't form.
+
+**Bring-up.**
+
+1. On **each** host, set `GARAGE_REPLICATION_FACTOR=3`, its `GARAGE_MAGIC_NAME`, `GARAGE_ZONE`, `GARAGE_CAPACITY`, and the shared `GARAGE_RPC_SECRET`. Leave `GARAGE_BOOTSTRAP_PEERS` blank for now.
+2. On **each** host: `./bootstrap.sh up garage`. Each node boots standalone and prints its peer id (`<pubkey>@<name>.<tailnet>:3901`). You can reprint it any time with `./bootstrap.sh garage-peer-id`.
+3. Join the three peer ids into one comma-separated string and set it as `GARAGE_BOOTSTRAP_PEERS` in **all three** `.env` files:
+   ```
+   GARAGE_BOOTSTRAP_PEERS=<id1>@garage-1.<tailnet>:3901,<id2>@garage-2.<tailnet>:3901,<id3>@garage-3.<tailnet>:3901
+   ```
+4. On **each** host: `./bootstrap.sh up garage` again. The nodes now find each other via the peer list.
+5. **Once**, on **any** host: `./bootstrap.sh provision-garage`. It waits for all three nodes to connect, assigns the layout (one node per zone), applies it, and then creates the buckets and per-app keys — paste the printed `<APP>_GARAGE_KEY_ID/SECRET` pairs into your app host's `.env` as usual.
+
+**How apps reach the cluster.** Apps target one S3 endpoint, `${GARAGE_S3_ENDPOINT_NAME}.${TS_TAILNET}:3900`. `GARAGE_S3_ENDPOINT_NAME` defaults to `garage` (the single node). For a cluster you have two choices — the second is what makes storage genuinely HA:
+
+- **Point at one node.** Set `GARAGE_S3_ENDPOINT_NAME` to any node's name. Data durability is spread across all three regardless, but that one node becomes an *availability* dependency for the S3 API path: if it's down, apps can't read/write until you repoint and restart them. Simplest; fine if you mainly want replication for durability.
+- **Point at the reverse proxy (recommended).** Run the S3 load-balancer below so app → S3 traffic fails over across all three nodes automatically.
+
+#### Highly available S3 endpoint
+
+The reverse proxy already fronts your public web tiers; here it also fronts the internal S3 API. It's a **layer-4 (TCP) load-balancer** — S3 SigV4 signs the `Host` header and path, so the bytes must pass through unaltered; a plain TCP proxy does exactly that, and Garage validates the request the app signed. (An HTTP proxy that rewrote headers would break every signature.)
+
+1. Enable the LB config on your reverse-proxy host: `nginx/sites-available/garage-s3.conf` (nginx stream) or the commented `:3900` `layer4` block in `caddy/Caddyfile`. List all three nodes as upstreams; bind the host's Tailscale IP so `:3900` isn't public.
+2. Set `GARAGE_S3_ENDPOINT_NAME` to the **reverse-proxy host's** MagicDNS name in the `.env` of every host that talks to S3 (app hosts, the backup host). Apps now sign for and dial the LB.
+3. Update the ACL from `acl.example.hujson` — it adds `tag:reverse-proxy → tag:garage:3900` (LB → nodes) and `<app tags> → tag:reverse-proxy:3900` (apps → LB).
+4. `./bootstrap.sh restart <app>` for each S3-using app so it picks up the new endpoint.
+
+The LB itself runs on the reverse-proxy host, which is already your ingress — so it's no *new* single point of failure for apps co-located there, and it survives the loss of any individual Garage node. PeerTube sets its endpoint separately (`PEERTUBE_OBJECT_STORAGE_ENDPOINT`), and because its SDK needs an IP rather than a name, point it at the LB host's Tailscale IP (`http://100.x.y.z:3900`).
+
+**Growing or shrinking.** Add a fourth node by booting it, appending its peer id to `GARAGE_BOOTSTRAP_PEERS` everywhere, re-running `up garage`, re-running `provision-garage`, and adding it to the LB upstream list. Removing a node is a `garage layout remove` operation — see the [Garage docs](https://garagehq.deuxfleurs.fr/documentation/cookbook/real-world/).
+
+## Postgres high availability
+
+Single-node Postgres is the default and needs none of this. This section is for surviving the loss of an entire Postgres **host** — the "my datacenter null-routed the box for days" scenario — by running a hot standby on a second host and a small router that always points apps at the current primary.
+
+**What this is (and isn't).** It's for *uptime*, not backups — keep `pg-backup` running regardless (a stolen/rebuilt host still needs a restore path). Replication is **async** (a standby hiccup never freezes your primary — the right call for cheap VPSes), so a failover can lose the last in-flight transactions. Promotion is **manual**: for a multi-day outage you have time to run one command, and skipping automatic failover means no etcd/Patroni quorum to babysit.
+
+**The pieces:**
+- **Primary + one hot standby**, each on a different host, each behind its own sidecar. The standby clones the primary with `pg_basebackup` and then streams. Set per host: `PG_ROLE` (`primary`/`standby`) and `PG_NODE_MAGIC_NAME` (e.g. `pg-primary` / `pg-standby`). Shared: `REPLICATION_USER`/`REPLICATION_PASSWORD` and `PG_PRIMARY_MAGIC_NAME`.
+- **`pg-router`** — a tiny nginx-stream sidecar that *takes the `DB_MAGIC_NAME` identity*. Apps keep dialing `${DB_MAGIC_NAME}.${TS_TAILNET}:5432` **unchanged**; the router forwards to `PG_PRIMARY_MAGIC_NAME`. It's a single-upstream forwarder, not a load-balancer (Postgres is single-writer). Runs on the app/reverse-proxy host.
+- **ACL**: the `tag:db-postgres → tag:db-postgres:5432` self-grant (in `acl.example.hujson`) covers both standby→primary replication and router→primary.
+
+**Bring-up:**
+1. **Primary host** — set `PG_ROLE=primary`, `PG_NODE_MAGIC_NAME=pg-primary`, and `REPLICATION_PASSWORD` (`openssl rand -hex 32`). `./bootstrap.sh up shared-db` — it starts as usual and creates the replication role + slot.
+2. **Standby host** — its own `.env` with `PG_ROLE=standby`, `PG_NODE_MAGIC_NAME=pg-standby`, `PG_PRIMARY_MAGIC_NAME=pg-primary`, the same `REPLICATION_USER`/`PASSWORD`, and `TS_TAILNET`. `./bootstrap.sh up shared-db` — it brings up Postgres only (no Redis), clones from the primary, and starts streaming. Verify on the primary: `docker exec <primary-pg> psql -U postgres -c 'SELECT client_addr,state FROM pg_stat_replication;'`.
+3. **App/router host** — set `DB_MAGIC_NAME` (unchanged — the name apps dial) and `PG_PRIMARY_MAGIC_NAME=pg-primary`. `./bootstrap.sh up pg-router`. Apps now reach the primary through it, no app change.
+
+**Failover runbook (primary host is gone):**
+1. On the **standby**: `./bootstrap.sh pg-promote` — promotes it to a read-write primary.
+2. On the **router host**: set `PG_PRIMARY_MAGIC_NAME=pg-standby` in `.env`, then `./bootstrap.sh up pg-router` — apps' connections drop and reconnect to the new primary (no app restart).
+3. Tidy-up: set `PG_ROLE=primary` in the promoted host's `.env` so it stays primary across restarts.
+4. When the **old primary's host returns**, re-clone it as the new standby: set `PG_ROLE=standby` + `PG_PRIMARY_MAGIC_NAME=pg-standby` in its `.env`, then `./bootstrap.sh pg-rejoin`. **Never** let the old primary resume as a second primary — that's split-brain. (`pg-rejoin` does a full re-clone, which always works; `pg_rewind` is faster but needs `wal_log_hints`/checksums enabled up front.)
+
+**Optional — WAL archiving to Garage S3.** Streaming alone is enough for the standby. If you also want the standby (or a rebuild) to catch up from object storage without loading the primary — and a continuous WAL archive on your now-HA Garage — add pgBackRest or wal-g pointed at a Garage bucket. It's additive and deliberately off the critical path; wire it when you want it.
+
+> Heads-up: this repo can't exercise a live Postgres, so treat the failover drill as something to **rehearse once on your two hosts** before you rely on it — promote, repoint, rejoin — so the runbook is muscle memory, not a first-time read during an incident.
 
 ## Email (SMTP)
 
@@ -339,9 +408,9 @@ The L4 edge (`stalwart/caddy/`) sends PROXY protocol v2 headers on mail ports so
 
 ### Configure storage (S3 / Garage)
 
-In **Settings → Store**, add a blob store pointing at your Garage instance:
-- Endpoint: `http://<GARAGE_MAGIC_NAME>.<TS_TAILNET>:3900`
-- Access key / secret: your Garage keys from `.env`
+`provision-stalwart` already wires this up; the manual equivalent, in **Settings → Store**, is a blob store pointing at your Garage instance:
+- Endpoint: `http://<GARAGE_S3_ENDPOINT_NAME>.<TS_TAILNET>:3900` (the single node, or your reverse-proxy LB — see [Highly available S3 endpoint](#highly-available-s3-endpoint))
+- Access key / secret: `STALWART_GARAGE_KEY_ID` / `STALWART_GARAGE_KEY_SECRET` from `.env`
 - Bucket: `stalwart-mail`
 
 ### Deploy the L4 edge
@@ -479,7 +548,7 @@ Garage gives you a place to put backups that isn't the same disk as your data. T
 
 `backup/pg-backup.sh` runs `pg_dumpall` inside the shared-db Postgres container, gzips the stream, and uploads it straight to `s3://pg-backups/pg-<timestamp>.sql.gz` in Garage — no local temp file. It then prunes objects older than `PG_BACKUP_RETENTION_DAYS` (default 14). The upload uses a throwaway `amazon/aws-cli` container pointed at the Garage S3 endpoint over the tailnet, so there's nothing extra to install on the host.
 
-**Prerequisites:** run it on the host where `shared-db` lives (it uses `docker exec`), with Garage up, `provision-garage` already run, and `GARAGE_ACCESS_KEY_ID` / `GARAGE_SECRET_ACCESS_KEY` filled into `.env`. On a multi-server setup, that means the shared-db host — and it needs an ACL grant to reach `tag:garage:3900` (the admin-owned host already has this; a dedicated backup host needs a grant added to `acl.example.hujson`).
+**Prerequisites:** run it on the host where `shared-db` lives (it uses `docker exec`), with Garage up, `provision-garage` already run, and `PG_BACKUP_GARAGE_KEY_ID` / `PG_BACKUP_GARAGE_KEY_SECRET` filled into `.env` (the pg-backups bucket has its own key). On a multi-server setup, that means the shared-db host — and it needs an ACL grant to reach `tag:garage:3900` (the admin-owned host already has this; a dedicated backup host needs a grant added to `acl.example.hujson`).
 
 #### Set it up (cron)
 
@@ -562,7 +631,7 @@ Two common causes. First: you ran `docker compose -f <stack>/...` from the repo 
 
 **Garage opt-in is on but the app can't reach the bucket**
 
-Confirm Garage is up and healthy (`./bootstrap.sh ps garage`), that you ran `./bootstrap.sh provision-garage` and pasted the printed `GARAGE_ACCESS_KEY_ID`/`SECRET` into `.env`, and that `tag:garage` is in both your OAuth client tags and the ACL.
+Confirm Garage is up and healthy (`./bootstrap.sh ps garage`), that you ran `./bootstrap.sh provision-garage` and pasted the printed per-app `<APP>_GARAGE_KEY_ID`/`SECRET` pairs into `.env`, and that `tag:garage` is in both your OAuth client tags and the ACL.
 
 **Funkwhale: the library counts uploads (size/track count) but the Tracks tab is empty**
 
@@ -594,13 +663,28 @@ You've added a `ports:` directive somewhere it shouldn't be. Containers using `n
 
 If you renamed a service in `.env`, the old name's device is now an unused ephemeral node. It will time out and disappear on its own, or you can delete it manually from the admin console.
 
+## Upgrading an existing deployment to the hardened credentials
+
+The Redis-auth, per-app-Garage-key, and Postgres `pg_hba` changes (from the `SECURITY.md` §5.7 recommendations) need a one-time migration on stacks deployed before them:
+
+1. Add `REDIS_APPS_PASSWORD` and `REDIS_AUTHELIA_PASSWORD` to `.env` (`openssl rand -hex 32` each).
+2. Update your Tailscale ACL from `acl.example.hujson` — the Redis grant changed (Stalwart added, Authelia moved to a new `tcp:6380` grant).
+3. `./bootstrap.sh restart shared-db` — Postgres picks up `pg_hba.conf`, the main Redis starts requiring the password, and the dedicated Authelia Redis instance appears. Apps will fail Redis auth until step 5, so proceed promptly.
+4. `./bootstrap.sh provision-garage` — mints the per-app keys and prints the `<APP>_GARAGE_KEY_ID`/`SECRET` pairs once; paste them into `.env`.
+5. `./bootstrap.sh restart <app>` for each running app stack (and `restart stalwart` re-runs its provisioning, which rewires its Redis URL and Garage key).
+6. After everything is green and one `pg-backup.sh` run has succeeded, delete the old all-bucket key: `provision-garage` prints the exact `garage key delete` command while it still exists.
+
+Anything outside this repo that probed Redis unauthenticated (e.g. a dashboard) now needs the password. Authelia sessions move to the new instance, so users will have to sign in again once.
+
 ## Security notes
 
 - Internal services (Postgres, Redis, Garage) have no exposed ports on your server. They are only reachable through your tailnet. This is enforced by container network configuration, not firewall rules — meaning a host firewall misconfiguration cannot expose them.
 - Access between services is controlled by Tailscale ACL tags. If you add a new app, make sure to add the right tags to the ACL or it won't be able to reach the database or storage. A side benefit: the ACL file doubles as the stack's connectivity documentation — every service port and inter-service relationship is spelled out in `acl.example.hujson`.
-- The `.env` file contains all your passwords and storage keys. Don't commit it to git. The included `.gitignore` excludes it by default; don't override that.
+- Inside the stack, credentials are partitioned per app: each app has its own Postgres role, its own Garage key (scoped to its own buckets), and Authelia's SSO session store runs in a dedicated password-protected Redis instance that app tiers cannot reach. Postgres additionally rejects any connection that doesn't arrive from a Tailscale address (`shared-db/pg_hba.conf`). A compromised app therefore can't read another app's database, media, or your login sessions.
+- The `.env` file contains all your passwords and storage keys. Don't commit it to git (the included `.gitignore` excludes it; don't override that), keep it `chmod 600` (bootstrap.sh enforces this), and only back it up encrypted.
 - Your OAuth client secret is roughly as sensitive as your Tailscale account credentials for this stack. Rotate it if you suspect exposure.
 - Public-facing apps are still public-facing. The tailnet protects internal service-to-service communication, not the public web interface. Standard web security applies: keep apps updated, use strong admin passwords, enable 2FA where supported.
+- **Read `SECURITY.md`.** It is an honest assessment of what this architecture does and does not protect against, and its §5 is the operator hardening checklist — the highest-leverage items are hardware-key MFA on your Tailscale and VPS provider accounts, `.env` custody, and SSH hygiene on the host. None of those can be templated in this repo; they're on you.
 
 ## Design philosophy
 

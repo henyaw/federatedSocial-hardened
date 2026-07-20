@@ -115,14 +115,18 @@ services:
       # bucket is PRIVATE — Lemmy proxies images through pict-rs (/pictrs/*),
       # so no public media host is needed (unlike the other apps). The bucket
       # must exist first: provision-garage creates 'lemmy-pictrs'. Credentials
-      # come from the shared GARAGE_* key. use_path_style is required for Garage.
+      # are the per-app Garage key (scoped to lemmy-pictrs only).
+      # use_path_style is required for Garage.
       PICTRS__STORE__TYPE: ${LEMMY_PICTRS_STORE:-filesystem}
-      PICTRS__STORE__ENDPOINT: http://${GARAGE_MAGIC_NAME}.${TS_TAILNET}:3900
+      # GARAGE_S3_ENDPOINT_NAME defaults to the single node; point it at the
+      # reverse-proxy host for the HA S3 load-balancer (README "Highly
+      # available S3 endpoint").
+      PICTRS__STORE__ENDPOINT: http://${GARAGE_S3_ENDPOINT_NAME:-garage}.${TS_TAILNET}:3900
       PICTRS__STORE__BUCKET_NAME: ${LEMMY_PICTRS_S3_BUCKET:-lemmy-pictrs}
       PICTRS__STORE__REGION: ${GARAGE_REGION:-garage}
       PICTRS__STORE__USE_PATH_STYLE: "true"
-      PICTRS__STORE__ACCESS_KEY: ${GARAGE_ACCESS_KEY_ID:-}
-      PICTRS__STORE__SECRET_KEY: ${GARAGE_SECRET_ACCESS_KEY:-}
+      PICTRS__STORE__ACCESS_KEY: ${LEMMY_GARAGE_KEY_ID:-}
+      PICTRS__STORE__SECRET_KEY: ${LEMMY_GARAGE_KEY_SECRET:-}
     volumes:
       # Single volume at /mnt — pict-rs keeps BOTH its sled metadata repo
       # (/mnt/sled-repo) AND the actual image files (/mnt/files) under /mnt.

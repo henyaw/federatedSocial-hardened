@@ -1,0 +1,69 @@
+# pg-router — the stable, app-facing Postgres endpoint for an HA deployment.
+#
+# WHAT IT IS. A tiny nginx stream (L4 TCP) proxy behind a Tailscale sidecar
+# that takes the DB_MAGIC_NAME identity. Apps keep dialing
+# ${DB_MAGIC_NAME}.${TS_TAILNET}:5432 exactly as before — no per-app change —
+# and this forwards them to whichever node is currently the primary
+# (PG_PRIMARY_MAGIC_NAME). On failover you promote the standby and re-point
+# this router; apps' connections drop and reconnect through it to the new
+# primary, no app restart. See README "Postgres high availability".
+#
+# ONLY for multi-host HA. A single-node deployment doesn't run this stack —
+# apps reach the one Postgres node directly (DB_MAGIC_NAME == that node).
+#
+# Runs on the same host as your apps / reverse proxy (co-located with the
+# clients it serves). Bring up with:  ./bootstrap.sh up pg-router
+# (which generates nginx.runtime.conf from nginx.conf first).
+
+name: federated-pg-router
+
+services:
+
+  ts-pg-router:
+    image: tailscale/tailscale:${TAILSCALE_VERSION:-v1.98.4}
+    # Takes the app-facing DB endpoint name. This is the whole trick: apps
+    # dial DB_MAGIC_NAME and land on the router, not on a fixed DB node.
+    hostname: ${DB_MAGIC_NAME}
+    environment:
+      TS_AUTHKEY: ${TS_OAUTH_CLIENT_SECRET}?ephemeral=true
+      # Same tag as the DB nodes: apps already have tag:db-postgres:5432, and
+      # the router -> primary hop is the tag:db-postgres self-grant in the ACL.
+      TS_EXTRA_ARGS: --advertise-tags=tag:db-postgres
+      TS_HOSTNAME: ${DB_MAGIC_NAME}
+      TS_ACCEPT_DNS: "true"
+      TS_AUTH_ONCE: "true"
+      TS_USERSPACE: "false"
+      TS_ENABLE_HEALTH_CHECK: "true"
+      TS_LOCAL_ADDR_PORT: "127.0.0.1:9002"
+    dns: [1.1.1.1, 1.0.0.1]
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:9002/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 30s
+    restart: unless-stopped
+
+  pg-router:
+    image: nginx:1.27-alpine
+    network_mode: "service:ts-pg-router"
+    # nginx.runtime.conf is generated from nginx.conf by `up pg-router`
+    # (and rewritten on failover). Gitignored; never edit it by hand.
+    volumes:
+      - ./nginx.runtime.conf:/etc/nginx/nginx.conf:ro
+    healthcheck:
+      # nginx up + able to open a TCP session to the configured primary.
+      test: ["CMD-SHELL", "nc -z -w3 127.0.0.1 5432 || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 4
+      start_period: 20s
+    depends_on:
+      ts-pg-router:
+        condition: service_healthy
+    restart: unless-stopped

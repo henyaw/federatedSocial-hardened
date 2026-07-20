@@ -4,30 +4,50 @@
 # `bootstrap.sh up garage` from this file and is gitignored. Edit this
 # file (the tracked template) and re-run `up garage` to apply changes.
 #
-# Dynamic fields substituted from .env at generation time:
-#   s3_region  ← GARAGE_REGION
+# Placeholder tokens below are substituted from .env at generation time
+# (see cmd_up in bootstrap.sh):
+#   s3_region             ← GARAGE_REGION
+#   replication_factor    ← GARAGE_REPLICATION_FACTOR (default 1)
+#   rpc_public_addr       ← this node's MagicDNS name:3901 (cluster only;
+#                           the line is deleted for a single node)
+#   bootstrap_peers       ← GARAGE_BOOTSTRAP_PEERS      (cluster only;
+#                           the line is deleted for a single node)
 #
 # rpc_secret is overridden at container start by the GARAGE_RPC_SECRET
 # environment variable — the placeholder below prevents parse errors.
 #
-# To expand to multiple nodes:
-#   - Add new node addresses to rpc_bootstrap_peers below.
-#   - Raise replication_factor (2 = tolerate 1 node loss, 3 = tolerate 2).
-#   - All nodes must share the same rpc_secret and replication_factor.
-#   - Re-run: ./bootstrap.sh provision-garage to assign the new node.
+# SINGLE NODE (default): GARAGE_REPLICATION_FACTOR unset/1 — the two cluster
+# tokens are stripped at generation time and this is a standalone store.
+#
+# THREE-NODE CLUSTER: set GARAGE_REPLICATION_FACTOR=3 and give each of the
+# three hosts its own GARAGE_MAGIC_NAME / GARAGE_ZONE, a shared
+# GARAGE_RPC_SECRET, and (after first boot) a shared GARAGE_BOOTSTRAP_PEERS.
+# See the Garage section of .env.example and the README "Multi-node Garage
+# cluster" section for the full bring-up sequence.
 
 metadata_dir = "/var/lib/garage/meta"
 data_dir     = "/var/lib/garage/data"
 
-# 1 = single-node (no replication). Safe to start with; raise when adding nodes.
-replication_factor = 1
+# 1 = single-node (no replication). 3 = three-way replication across a
+# three-node cluster (tolerates losing 2 nodes without data loss). Every
+# node in a cluster MUST agree on this value.
+replication_factor = __GARAGE_REPLICATION_FACTOR__
 
 # Placeholder — overridden by GARAGE_RPC_SECRET env var at container start.
 rpc_secret    = "0000000000000000000000000000000000000000000000000000000000000000"
 rpc_bind_addr = "0.0.0.0:3901"
 
-# Uncomment and populate when adding a second node:
-# rpc_bootstrap_peers = ["<node-id>@<tailnet-hostname>:3901"]
+# The address peers use to reach THIS node for RPC. Set to this node's stable
+# MagicDNS name (never its tailnet IP — ephemeral sidecars get a new IP on
+# every restart, but the MagicDNS name is stable). Present only in cluster
+# mode; harmless-absent for a single node.
+__GARAGE_RPC_PUBLIC_ADDR__
+
+# Peers to dial on cold start, as "<node-pubkey>@<magicdns-name>:3901". Node
+# pubkeys are minted on each node's first boot; collect them with
+# `./bootstrap.sh garage-peer-id` and paste the combined list into
+# GARAGE_BOOTSTRAP_PEERS on every host. Present only in cluster mode.
+__GARAGE_BOOTSTRAP_PEERS__
 
 [s3_api]
 # Region name presented to S3 clients. Must match GARAGE_REGION in .env.

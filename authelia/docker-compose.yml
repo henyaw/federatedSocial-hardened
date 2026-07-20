@@ -42,7 +42,7 @@ services:
       - NET_ADMIN
       - NET_RAW
     healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:9002/healthz && nc -z -w3 ${DB_MAGIC_NAME}.${TS_TAILNET} 5432 && nc -z -w3 ${REDIS_MAGIC_NAME}.${TS_TAILNET} 6379"]
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:9002/healthz && nc -z -w3 ${DB_MAGIC_NAME}.${TS_TAILNET} 5432 && nc -z -w3 ${REDIS_MAGIC_NAME}.${TS_TAILNET} 6380"]
       interval: 10s
       timeout: 15s
       retries: 6
@@ -62,9 +62,13 @@ services:
       AUTHELIA_STORAGE_POSTGRES_DATABASE: ${AUTHELIA_DB_NAME:-authelia}
       AUTHELIA_STORAGE_POSTGRES_USERNAME: ${AUTHELIA_DB_USER:-authelia}
       AUTHELIA_STORAGE_POSTGRES_PASSWORD: ${AUTHELIA_DB_PASSWORD}
-      # Redis session cache
+      # Redis session cache — Authelia's DEDICATED instance on port 6380
+      # (shared-db/docker-compose.yml redis-authelia), with its own password.
+      # Fediverse apps have neither this password nor an ACL grant to 6380,
+      # so SSO session state is out of their reach (SECURITY.md §5.7).
       AUTHELIA_SESSION_REDIS_HOST: ${REDIS_MAGIC_NAME}.${TS_TAILNET}
-      AUTHELIA_SESSION_REDIS_PORT: "6379"
+      AUTHELIA_SESSION_REDIS_PORT: "6380"
+      AUTHELIA_SESSION_REDIS_PASSWORD: ${REDIS_AUTHELIA_PASSWORD}
       AUTHELIA_SESSION_REDIS_DATABASE_INDEX: ${AUTHELIA_REDIS_DB:-4}
       # Secrets — all required before first boot.
       # NOTE: session.cookies domain is YAML-only (no env var equivalent in

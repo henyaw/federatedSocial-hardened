@@ -21,7 +21,7 @@
 #   COPY ...), so psql against the maintenance DB replays the whole cluster.
 #
 # Requirements: same as pg-backup.sh (run on the shared-db host; Garage
-# reachable; GARAGE_* keys in .env).
+# reachable; PG_BACKUP_GARAGE_KEY_ID/SECRET in .env).
 
 set -euo pipefail
 
@@ -35,9 +35,12 @@ PG_BACKUP_BUCKET="${PG_BACKUP_BUCKET:-pg-backups}"
 PG_BACKUP_PREFIX="${PG_BACKUP_PREFIX:-pg-}"
 GARAGE_REGION="${GARAGE_REGION:-garage}"
 AWSCLI_IMAGE="${AWSCLI_IMAGE:-amazon/aws-cli:latest}"
-GARAGE_ENDPOINT="http://${GARAGE_MAGIC_NAME}.${TS_TAILNET}:3900"
+# GARAGE_S3_ENDPOINT_NAME defaults to the single node ("garage"); in a
+# multi-node cluster set it to the reverse-proxy host so restores read through
+# the HA S3 load-balancer (README "Highly available S3 endpoint").
+GARAGE_ENDPOINT="http://${GARAGE_S3_ENDPOINT_NAME:-garage}.${TS_TAILNET}:3900"
 
-for v in GARAGE_MAGIC_NAME TS_TAILNET GARAGE_ACCESS_KEY_ID GARAGE_SECRET_ACCESS_KEY; do
+for v in TS_TAILNET PG_BACKUP_GARAGE_KEY_ID PG_BACKUP_GARAGE_KEY_SECRET; do
   [[ -n "${!v:-}" ]] || { echo "Error: ${v} is not set in .env" >&2; exit 1; }
 done
 
@@ -45,8 +48,8 @@ log() { echo "[pg-restore] $*"; }
 
 aws_garage() {
   docker run --rm -i --network host \
-    -e AWS_ACCESS_KEY_ID="${GARAGE_ACCESS_KEY_ID}" \
-    -e AWS_SECRET_ACCESS_KEY="${GARAGE_SECRET_ACCESS_KEY}" \
+    -e AWS_ACCESS_KEY_ID="${PG_BACKUP_GARAGE_KEY_ID}" \
+    -e AWS_SECRET_ACCESS_KEY="${PG_BACKUP_GARAGE_KEY_SECRET}" \
     -e AWS_DEFAULT_REGION="${GARAGE_REGION}" \
     "${AWSCLI_IMAGE}" \
     --endpoint-url "${GARAGE_ENDPOINT}" "$@"

@@ -32,6 +32,9 @@ x-mastodon-env: &mastodon-env
 
   REDIS_HOST: ${REDIS_MAGIC_NAME}.${TS_TAILNET}
   REDIS_PORT: "6379"
+  # Shared password for the main Redis instance (default user). Authelia's
+  # session store lives on a separate instance this password cannot reach.
+  REDIS_PASSWORD: ${REDIS_APPS_PASSWORD}
 
   SECRET_KEY_BASE: ${MASTODON_SECRET_KEY_BASE}
   OTP_SECRET: ${MASTODON_OTP_SECRET}
@@ -59,12 +62,17 @@ x-mastodon-env: &mastodon-env
   S3_BUCKET: ${MASTODON_S3_BUCKET:-mastodon-media}
   S3_REGION: ${GARAGE_REGION:-garage}
   # Inline MagicDNS — Compose does not expand vars inside vars.
-  S3_ENDPOINT: http://${GARAGE_MAGIC_NAME}.${TS_TAILNET}:3900
+  # GARAGE_S3_ENDPOINT_NAME defaults to the single node; point it at the
+  # reverse-proxy host for the HA S3 load-balancer (README "Highly available
+  # S3 endpoint").
+  S3_ENDPOINT: http://${GARAGE_S3_ENDPOINT_NAME:-garage}.${TS_TAILNET}:3900
   S3_PROTOCOL: http
   # Garage uses path-style S3 API (bucket/key, not bucket.endpoint/key).
   S3_FORCE_SINGLE_REQUEST: "true"
-  AWS_ACCESS_KEY_ID: ${GARAGE_ACCESS_KEY_ID:-}
-  AWS_SECRET_ACCESS_KEY: ${GARAGE_SECRET_ACCESS_KEY:-}
+  # Per-app Garage key (printed by provision-garage) — scoped to the
+  # mastodon-media bucket only.
+  AWS_ACCESS_KEY_ID: ${MASTODON_GARAGE_KEY_ID:-}
+  AWS_SECRET_ACCESS_KEY: ${MASTODON_GARAGE_KEY_SECRET:-}
   # Optional CDN hostname for public media URLs. Leave blank to use the
   # Garage tailnet endpoint directly (fine for private/small instances).
   S3_ALIAS_HOST: ${MASTODON_S3_ALIAS_HOST:-}

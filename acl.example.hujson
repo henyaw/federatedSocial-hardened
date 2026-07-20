@@ -96,6 +96,10 @@
   "grants": [
     // App tiers reach shared Postgres on TCP/5432 only.
     // Add new app tags to this src list when you bring them up.
+    // NOTE: in an HA deployment the app-facing endpoint (DB_MAGIC_NAME) is the
+    // pg-router sidecar, which also carries tag:db-postgres — so this same
+    // grant covers apps -> router. The router -> primary and standby ->
+    // primary hops are the tag:db-postgres self-grant just below.
     {
       "src": [
         "tag:pixelfed-web", "tag:pixelfed-worker",
@@ -113,10 +117,25 @@
       "ip":  ["tcp:5432"],
     },
 
-    // App tiers reach shared Redis on TCP/6379 only.
+    // Postgres HA (optional): node-to-node on TCP/5432. Every Postgres node
+    // and the pg-router carry tag:db-postgres, so this one self-grant covers
+    // BOTH the standby -> primary streaming-replication connection and the
+    // pg-router -> current-primary hop. Harmless for a single node (nothing
+    // dials it). See README "Postgres high availability".
+    {
+      "src": ["tag:db-postgres"],
+      "dst": ["tag:db-postgres"],
+      "ip":  ["tcp:5432"],
+    },
+
+    // App tiers reach the main shared Redis on TCP/6379 only.
     // GoToSocial is intentionally omitted — it has no Redis dependency.
-    // Stalwart is intentionally omitted — it uses Garage not Redis.
     // Lemmy is intentionally omitted — it uses Postgres only.
+    // Stalwart is included — provision-stalwart wires its in-memory store
+    // to Redis logical DB 3 on this instance.
+    // Authelia is intentionally NOT here: its session store runs in the
+    // dedicated redis-authelia instance on TCP/6380 (next grant), so a
+    // compromised app tier cannot reach SSO session state (SECURITY.md §5.7).
     {
       "src": [
         "tag:pixelfed-web", "tag:pixelfed-worker",
@@ -124,10 +143,19 @@
         "tag:diaspora-web",
         "tag:funkwhale-web", "tag:funkwhale-worker",
         "tag:peertube-web",
-        "tag:authelia",
+        "tag:stalwart",
       ],
       "dst": ["tag:db-redis"],
       "ip":  ["tcp:6379"],
+    },
+
+    // Authelia's dedicated session Redis (same tailnet node as the main
+    // Redis — it shares the ts-redis sidecar — but a different port, so
+    // this grant is the only path to it).
+    {
+      "src": ["tag:authelia"],
+      "dst": ["tag:db-redis"],
+      "ip":  ["tcp:6380"],
     },
 
     // Stalwart mail server — reached by the L4 edge on all mail ports plus
@@ -259,6 +287,46 @@
       "src": ["tag:reverse-proxy"],
       "dst": ["tag:garage"],
       "ip":  ["tcp:3902"],
+    },
+
+    // Highly-available S3 endpoint (optional, multi-node). When apps target
+    // the S3 API through the reverse-proxy load-balancer (GARAGE_S3_ENDPOINT_NAME
+    // = the reverse-proxy host; see nginx/sites-available/garage-s3.conf), the
+    // LB needs to reach every node's S3 API upstream (TCP/3900)...
+    {
+      "src": ["tag:reverse-proxy"],
+      "dst": ["tag:garage"],
+      "ip":  ["tcp:3900"],
+    },
+    // ...and the app tiers need to reach the LB on the reverse-proxy host.
+    // (Only needed when GARAGE_S3_ENDPOINT_NAME points at the reverse proxy;
+    // apps that dial a Garage node directly use the tag:garage:3900 grant
+    // below instead.)
+    {
+      "src": [
+        "tag:pixelfed-web", "tag:pixelfed-worker",
+        "tag:mastodon-web", "tag:mastodon-streaming", "tag:mastodon-sidekiq",
+        "tag:diaspora-web",
+        "tag:funkwhale-web", "tag:funkwhale-worker",
+        "tag:gotosocial-web",
+        "tag:peertube-web",
+        "tag:lemmy-web",
+        "tag:stalwart",
+        "tag:db-postgres",
+      ],
+      "dst": ["tag:reverse-proxy"],
+      "ip":  ["tcp:3900"],
+    },
+
+    // Garage cluster RPC (TCP/3901) — node-to-node replication and gossip.
+    // REQUIRED for a multi-node cluster; without it the nodes cannot form a
+    // cluster and layout apply hangs waiting for peers. Harmless for a
+    // single node (nothing dials it). Every Garage node carries tag:garage,
+    // so this grant lets each node reach every other node on 3901 only.
+    {
+      "src": ["tag:garage"],
+      "dst": ["tag:garage"],
+      "ip":  ["tcp:3901"],
     },
 
     // Admins (you, on your laptop) reach everything for debugging.
