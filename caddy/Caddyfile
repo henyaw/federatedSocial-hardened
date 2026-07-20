@@ -243,14 +243,6 @@ diaspora.example.com {
 }
 
 # ---------------------------------------------------------------------------
-# Plume
-# ---------------------------------------------------------------------------
-# Rocket (Rust) on :7878 serves the whole app — federation, web UI, assets.
-plume.example.com {
-  reverse_proxy plume.tailfe8c.ts.net:7878
-}
-
-# ---------------------------------------------------------------------------
 # Funkwhale
 # ---------------------------------------------------------------------------
 # The funkwhale `front` container (nginx serving the Vue SPA and proxying to
