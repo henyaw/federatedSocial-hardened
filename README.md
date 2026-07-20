@@ -438,6 +438,28 @@ At minimum you'll need:
 - `DMARC` TXT record
 - `_mta-sts` and `_smtp._tls` TXT records (Stalwart auto-serves `/.well-known/mta-sts.txt` once TLS is up)
 
+Running a second node ([Stalwart high availability](#stalwart-high-availability) below)? Add a **second `MX` record** at a higher priority number (lower preference) pointing at node 2's own hostname — see that section for the full picture; `SPF`'s `mx` mechanism covers both automatically since it just means "whatever my MX records say."
+
+### Stalwart high availability
+
+Single-node Stalwart is the default and needs none of this. This section is for surviving the loss of an entire mail **host** by running a second, independent Stalwart node with its own public mail hostname and its own `MX` record — same "days-long DC outage" motivation as [Postgres high availability](#postgres-high-availability) above, and only worth doing once that's in place: **a second Stalwart node is only as available as the Postgres + Garage it reads from.**
+
+**Why this is low-effort compared to Postgres/Garage HA.** Stalwart's clustering model is stateless-by-design: a node holds no authoritative state of its own. Accounts, domains, DKIM keys, and every setting live in the shared Postgres (already covered by [Postgres high availability](#postgres-high-availability)); mail bodies live in the shared Garage bucket (already covered by [Multi-node Garage cluster](#multi-node-garage-cluster)); the full-text search index defaults to living inside that same Postgres store too. Point a second node at the same three backends and it's already running the same mailboxes — there's no data to replicate between the two Stalwart processes themselves.
+
+**What does need coordinating** is soft, best-effort signaling between nodes — "a mailbox changed," "an IMAP client is IDLE-waiting," "a cert was just renewed, don't also request one." Stalwart calls this the **coordinator**, and it reuses this stack's existing Redis (the same connection already wired for Stalwart's in-memory store) rather than needing anything new. Redis being single-instance in this stack (deliberately — see the Redis section of `.env.example`) means this coordination can drop out during a Redis outage; that only costs responsiveness (a push notification arrives late, or two nodes briefly both attempt a cert renewal), never correctness, since Postgres and Garage remain the source of truth throughout.
+
+**What this buys you, precisely.** Two fully independent SMTP/IMAP servers means inbound mail delivery survives the total loss of either host — sending mail servers retry the next `MX` record for days, which is exactly your failure window. It does **not** give you automatic IMAP/JMAP/webmail failover: mail clients are configured with one fixed hostname, and DNS doesn't have an `MX`-style priority mechanism for those protocols. During an outage, mail keeps arriving (queued on node 2) but node 1's mailbox users can't fetch it until either node 1 returns or you manually repoint that hostname's DNS at node 2 — the same "acceptable manual step during a rare, already-severe incident" tradeoff this repo makes for Postgres promotion.
+
+**Bring-up** (full detail in the `.env.example` Stalwart HA block):
+
+1. **Node 1** (existing, unchanged): set `STALWART_CLUSTER_ENABLE=true` and re-run `./bootstrap.sh up stalwart` — this is the only change to your existing node.
+2. **Node 2**, its own host, its own `.env`: copy node 1's *shared-identity* Stalwart vars verbatim (`STALWART_DOMAIN`, `STALWART_HOSTNAME`, `STALWART_DB_*`, `STALWART_S3_BUCKET`, `STALWART_RELAY_*`, `STALWART_FALLBACK_ADMIN_SECRET`, and the `GARAGE_*`/`REDIS_*`/`DB_MAGIC_NAME`/`TS_TAILNET` values it reaches the shared backends through) — these all write to **one** shared row set in Postgres, so any mismatch on node 2 silently overwrites node 1's config. The one value that **must** differ is `STALWART_MAGIC_NAME` (e.g. `stalwart-2`) — it's this node's own MagicDNS name and doubles as its cluster node-id.
+3. `./bootstrap.sh up stalwart` on node 2. It joins the same shared config (idempotent — no duplicate domain/accounts created) and wires the coordinator.
+4. Deploy `stalwart/caddy/` on node 2's **own** public-facing box, `.env`'s `STALWART_MAGIC_NAME` pointing at node 2. **Omit the `"web"` `:443` server block** in its `caddy.json` (the template already anticipates this — "a mail-only edge omits this server"): `MTA-STS`/`autoconfig`/`autodiscover` stay node-1-only, a deliberate asymmetry rather than an oversight — those are low-stakes conveniences, not mail delivery. Give node 2 its **own narrow ACME cert** (its own hostname only, *not* a wildcard) via its own admin UI — this sidesteps any duplicate-issuance collision with node 1's wildcard cert entirely, since the two certs cover disjoint names.
+5. Add the second `MX` record from the previous section, pointing at node 2's edge hostname.
+
+No ACL changes are needed — both nodes carry `tag:stalwart`, and the existing tag-based grants (`tag:stalwart → tag:db-postgres`, `→ tag:db-redis`, `→ tag:garage`, and `tag:reverse-proxy → tag:stalwart`) already cover any number of nodes. You do need to apply `tag:reverse-proxy` to node 2's edge host in the Tailscale admin console, same one-time step as any new reverse-proxy box.
+
 ---
 
 ## Authelia: first-boot configuration

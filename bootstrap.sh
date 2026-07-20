@@ -674,6 +674,24 @@ cmd_provision_stalwart() {
       "url":$url
     }}},"0"]]')")"
 
+  # ── Cluster coordinator (optional, multi-node) ────────────────────────────
+  # Only when STALWART_CLUSTER_ENABLE=true (see README "Stalwart high
+  # availability") — single-node deployments skip this entirely, unchanged.
+  # "Default" reuses the InMemoryStore connection just configured above (same
+  # Redis, same credentials) for the pub/sub that propagates mailbox change
+  # hints, IMAP IDLE/push triggers, and ACME cert availability across nodes.
+  # This is best-effort, non-persistent pub/sub (per Stalwart's own docs) —
+  # authoritative state is always Postgres + Garage, both shared and durable,
+  # so a missed pub/sub message degrades responsiveness, not correctness.
+  if [[ "${STALWART_CLUSTER_ENABLE:-false}" == "true" ]]; then
+    echo "[bootstrap] Setting cluster coordinator (Default — reuses the Redis in-memory store)..."
+    _sw_ok "$(_sw_call "$(jq -nc \
+      --arg acct "$_SW_ACCT_ID" \
+      '[["x:Coordinator/set",{"accountId":$acct,"update":{"singleton":{
+        "@type":"Default"
+      }}},"0"]]')")"
+  fi
+
   # ── Primary domain ────────────────────────────────────────────────────────
   echo "[bootstrap] Ensuring domain ${STALWART_DOMAIN} (catch-all → ${relay_addr})..."
   local domain_id
