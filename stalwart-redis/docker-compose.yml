@@ -1,0 +1,87 @@
+# Stalwart's dedicated Redis instance — sidecar pattern, no host port bindings.
+#
+# Deliberately SEPARATE from shared-db's Redis (used by the fediverse apps):
+# HA only makes sense scoped to what actually needs it. Stalwart's Redis-
+# backed in-memory store is the piece with real availability stakes — rate
+# limiting, fail2ban, distributed locks, OAuth codes, ACME tokens,
+# greylisting, and (if STALWART_CLUSTER_ENABLE=true) the cluster coordinator
+# — see README "Stalwart Redis high availability". The fediverse apps' Redis
+# stays single-instance (see CLAUDE.md's open design questions and the Redis
+# section of shared-db/docker-compose.yml).
+#
+# Single-node: bring this up once (STALWART_REDIS_ROLE unset/"primary") and
+# STALWART_REDIS_MAGIC_NAME points straight at it — no router needed.
+# HA: run this stack on TWO hosts (STALWART_REDIS_ROLE=primary / standby,
+# each with its own STALWART_REDIS_NODE_MAGIC_NAME), and also run
+# stalwart-redis-router/ so Stalwart's connection target
+# (STALWART_REDIS_MAGIC_NAME) stays stable across a promotion.
+
+name: federated-stalwart-redis
+
+services:
+
+  ts-stalwart-redis:
+    image: tailscale/tailscale:${TAILSCALE_VERSION:-v1.98.4}
+    # This node's OWN MagicDNS name. Single-node: leave
+    # STALWART_REDIS_NODE_MAGIC_NAME unset so it defaults to
+    # STALWART_REDIS_MAGIC_NAME and Stalwart reaches this node directly. HA:
+    # each host sets its own node name; STALWART_REDIS_MAGIC_NAME instead
+    # names the stalwart-redis-router sidecar. See README "Stalwart Redis
+    # high availability".
+    hostname: ${STALWART_REDIS_NODE_MAGIC_NAME:-stalwart-redis}
+    environment:
+      TS_AUTHKEY: ${TS_OAUTH_CLIENT_SECRET}?ephemeral=true
+      TS_EXTRA_ARGS: --advertise-tags=tag:stalwart-redis
+      TS_HOSTNAME: ${STALWART_REDIS_NODE_MAGIC_NAME:-stalwart-redis}
+      TS_ACCEPT_DNS: "true"
+      TS_AUTH_ONCE: "true"
+      TS_USERSPACE: "false"
+      TS_ENABLE_HEALTH_CHECK: "true"
+      TS_LOCAL_ADDR_PORT: "127.0.0.1:9002"
+    dns: [1.1.1.1, 1.0.0.1]
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:9002/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 30s
+    restart: unless-stopped
+
+  stalwart-redis:
+    image: redis:7-alpine
+    network_mode: "service:ts-stalwart-redis"
+    # redis-stalwart-entrypoint.sh builds the redis-server invocation from
+    # STALWART_REDIS_ROLE: a plain instance for "primary" (default,
+    # single-node behaviour unchanged), or one with --replicaof +
+    # --masterauth for "standby". Unlike Postgres, no manual clone step is
+    # needed — Redis performs its own full resync in the background once
+    # --replicaof is set, and re-syncs automatically on reconnect.
+    entrypoint: ["/usr/local/bin/redis-stalwart-entrypoint.sh"]
+    environment:
+      STALWART_REDIS_PASSWORD: ${STALWART_REDIS_PASSWORD}
+      STALWART_REDIS_ROLE: ${STALWART_REDIS_ROLE:-primary}
+      STALWART_REDIS_PRIMARY_MAGIC_NAME: ${STALWART_REDIS_PRIMARY_MAGIC_NAME:-}
+      TS_TAILNET: ${TS_TAILNET:-}
+      # Lets the healthcheck's redis-cli authenticate without leaking the
+      # password into `docker inspect` healthcheck args or process lists.
+      REDISCLI_AUTH: ${STALWART_REDIS_PASSWORD}
+    volumes:
+      - stalwart-redis-data:/data
+      - ./redis-stalwart-entrypoint.sh:/usr/local/bin/redis-stalwart-entrypoint.sh:ro
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+    depends_on:
+      ts-stalwart-redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  stalwart-redis-data:

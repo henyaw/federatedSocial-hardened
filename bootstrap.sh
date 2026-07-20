@@ -41,7 +41,7 @@ ENV_FILE="${REPO_ROOT}/.env"
 # Operator-local log directory. Rootless by design: things like the pg-backup
 # cron log here instead of /var/log, so an unprivileged shell account works.
 mkdir -p "${REPO_ROOT}/log"
-ALL_STACKS=(shared-db garage pixelfed mastodon diaspora funkwhale gotosocial peertube stalwart authelia lemmy pg-router)
+ALL_STACKS=(shared-db garage pixelfed mastodon diaspora funkwhale gotosocial peertube stalwart stalwart-redis stalwart-redis-router authelia lemmy pg-router)
 # Stacks that need a Postgres DB provisioned before starting.
 DB_STACKS=(pixelfed mastodon diaspora funkwhale gotosocial peertube stalwart authelia lemmy)
 
@@ -610,8 +610,8 @@ cmd_provision_stalwart() {
 
   local missing=()
   for v in STALWART_MAGIC_NAME TS_TAILNET STALWART_DOMAIN STALWART_HOSTNAME \
-            STALWART_FALLBACK_ADMIN_SECRET STALWART_REDIS_DB \
-            REDIS_MAGIC_NAME REDIS_APPS_PASSWORD \
+            STALWART_FALLBACK_ADMIN_SECRET \
+            STALWART_REDIS_MAGIC_NAME STALWART_REDIS_PASSWORD \
             GARAGE_MAGIC_NAME GARAGE_REGION \
             STALWART_GARAGE_KEY_ID STALWART_GARAGE_KEY_SECRET \
             STALWART_S3_BUCKET STALWART_RELAY_USER STALWART_RELAY_PASSWORD; do
@@ -663,11 +663,16 @@ cmd_provision_stalwart() {
     }}},"0"]]')")"
 
   # ── In-memory store → Redis ───────────────────────────────────────────────
-  # Default-user auth on the main Redis instance. REDIS_APPS_PASSWORD must be
-  # URL-safe (openssl rand -hex 32) — it is embedded in the connection URL.
-  echo "[bootstrap] Setting in-memory store (Redis db ${STALWART_REDIS_DB})..."
+  # Stalwart's OWN dedicated Redis instance (stalwart-redis/), separate from
+  # the fediverse apps' shared Redis — see README "Stalwart Redis high
+  # availability" for why. STALWART_REDIS_MAGIC_NAME is the stable endpoint:
+  # a single node directly, or the stalwart-redis-router sidecar in an HA
+  # deployment — either way this URL never needs to change on failover.
+  # STALWART_REDIS_PASSWORD must be URL-safe (openssl rand -hex 32) — it is
+  # embedded in the connection URL.
+  echo "[bootstrap] Setting in-memory store (Redis, ${STALWART_REDIS_MAGIC_NAME})..."
   _sw_ok "$(_sw_call "$(jq -nc \
-    --arg url  "redis://:${REDIS_APPS_PASSWORD}@${REDIS_MAGIC_NAME}.${TS_TAILNET}:6379/${STALWART_REDIS_DB}" \
+    --arg url  "redis://:${STALWART_REDIS_PASSWORD}@${STALWART_REDIS_MAGIC_NAME}.${TS_TAILNET}:6379" \
     --arg acct "$_SW_ACCT_ID" \
     '[["x:InMemoryStore/set",{"accountId":$acct,"update":{"singleton":{
       "@type":"Redis",
@@ -1050,6 +1055,90 @@ cmd_pg_rejoin() {
   _cmd_up_pg_standby
 }
 
+# ---------------------------------------------------------------------------
+# Stalwart Redis high availability (see README "Stalwart Redis high availability")
+# ---------------------------------------------------------------------------
+
+# Bring up stalwart-redis as a standby. Unlike Postgres, there is no manual
+# clone step — redis-stalwart-entrypoint.sh passes --replicaof at container
+# start and redis-server performs the full sync itself in the background.
+_cmd_up_stalwart_redis_standby() {
+  local missing=()
+  for v in STALWART_REDIS_NODE_MAGIC_NAME STALWART_REDIS_PRIMARY_MAGIC_NAME TS_TAILNET STALWART_REDIS_PASSWORD; do
+    [[ -n "${!v:-}" ]] || missing+=("$v")
+  done
+  [[ ${#missing[@]} -eq 0 ]] || die "stalwart-redis standby needs these in .env: ${missing[*]}
+  STALWART_REDIS_ROLE=standby; STALWART_REDIS_NODE_MAGIC_NAME=this node (e.g. stalwart-redis-standby);
+  STALWART_REDIS_PRIMARY_MAGIC_NAME=the primary (e.g. stalwart-redis-primary)."
+
+  echo "[bootstrap] stalwart-redis STANDBY: this node = ${STALWART_REDIS_NODE_MAGIC_NAME}, primary = ${STALWART_REDIS_PRIMARY_MAGIC_NAME}"
+
+  echo "[bootstrap] Starting ts-stalwart-redis sidecar..."
+  if ! dc stalwart-redis up -d ts-stalwart-redis; then _check_ts_auth stalwart-redis; exit 1; fi
+
+  echo "[bootstrap] Starting Redis standby (replicaof the primary at startup)..."
+  if ! dc stalwart-redis up -d stalwart-redis; then
+    echo "[bootstrap] Standby failed to start. Common causes:" >&2
+    echo "[bootstrap]   - primary not reachable at ${STALWART_REDIS_PRIMARY_MAGIC_NAME}.${TS_TAILNET}:6379" >&2
+    echo "[bootstrap]   - STALWART_REDIS_PASSWORD doesn't match the primary's (it doubles as masterauth)" >&2
+    echo "[bootstrap]   - ACL missing tag:stalwart-redis -> tag:stalwart-redis:6379" >&2
+    echo "[bootstrap]   Logs: ./bootstrap.sh logs stalwart-redis stalwart-redis" >&2
+    exit 1
+  fi
+  echo "[bootstrap] Standby up. Confirm streaming ON THE PRIMARY:"
+  echo "[bootstrap]   docker exec <primary-redis> redis-cli -a \"\$STALWART_REDIS_PASSWORD\" --no-auth-warning info replication"
+}
+
+# Generate the stalwart-redis-router nginx config from the current primary
+# and (re)start it. Also the failover repoint step: change
+# STALWART_REDIS_PRIMARY_MAGIC_NAME, re-run this.
+_cmd_up_stalwart_redis_router() {
+  local missing=()
+  for v in STALWART_REDIS_MAGIC_NAME STALWART_REDIS_PRIMARY_MAGIC_NAME TS_TAILNET; do
+    [[ -n "${!v:-}" ]] || missing+=("$v")
+  done
+  [[ ${#missing[@]} -eq 0 ]] || die "stalwart-redis-router needs these in .env: ${missing[*]}
+  STALWART_REDIS_MAGIC_NAME = the endpoint Stalwart already dials;
+  STALWART_REDIS_PRIMARY_MAGIC_NAME = the CURRENT primary node (e.g. stalwart-redis-primary)."
+
+  local addr="${STALWART_REDIS_PRIMARY_MAGIC_NAME}.${TS_TAILNET}:6379"
+  sed "s|__STALWART_REDIS_PRIMARY_ADDR__|${addr}|" \
+    "${REPO_ROOT}/stalwart-redis-router/nginx.conf" > "${REPO_ROOT}/stalwart-redis-router/nginx.runtime.conf"
+  echo "[bootstrap] Generated stalwart-redis-router/nginx.runtime.conf (${STALWART_REDIS_MAGIC_NAME} -> ${addr})."
+
+  echo "[bootstrap] Starting stalwart-redis-router..."
+  if ! dc stalwart-redis-router up -d; then _check_ts_auth stalwart-redis-router; exit 1; fi
+  # If only the mounted config changed (failover repoint), 'up -d' won't
+  # recreate the container — reload nginx so it re-reads the new upstream.
+  local rc; rc=$(dc stalwart-redis-router ps -q stalwart-redis-router 2>/dev/null | head -1)
+  [[ -n "$rc" ]] && docker exec "$rc" nginx -s reload >/dev/null 2>&1 || true
+  echo "[bootstrap] stalwart-redis-router up. Stalwart reaches ${STALWART_REDIS_MAGIC_NAME}.${TS_TAILNET}:6379 -> ${STALWART_REDIS_PRIMARY_MAGIC_NAME}."
+}
+
+# Promote this standby to primary (run ON THE STANDBY host during a
+# failover). Unlike Postgres, no data-consistency ceremony is needed:
+# REPLICAOF NO ONE just stops replicating and starts accepting writes.
+cmd_stalwart_redis_promote() {
+  [[ "${STALWART_REDIS_ROLE:-primary}" == "standby" ]] || \
+    die "Run this on the STANDBY host (STALWART_REDIS_ROLE=standby). This host is '${STALWART_REDIS_ROLE:-primary}'."
+  local c; c=$(dc stalwart-redis ps -q stalwart-redis 2>/dev/null | head -1)
+  [[ -n "$c" ]] || die "stalwart-redis standby not running here. ./bootstrap.sh up stalwart-redis"
+  echo "[bootstrap] Promoting this standby to primary..."
+  docker exec "$c" redis-cli -a "${STALWART_REDIS_PASSWORD}" --no-auth-warning REPLICAOF NO ONE \
+    || die "REPLICAOF NO ONE failed — see ./bootstrap.sh logs stalwart-redis stalwart-redis"
+  echo "[bootstrap] Promoted. This node (${STALWART_REDIS_NODE_MAGIC_NAME:-this host}) is now PRIMARY."
+  echo "[bootstrap]"
+  echo "[bootstrap] FINISH FAILOVER — on the stalwart-redis-router host:"
+  echo "[bootstrap]   1. set STALWART_REDIS_PRIMARY_MAGIC_NAME=${STALWART_REDIS_NODE_MAGIC_NAME:-<this node>} in its .env"
+  echo "[bootstrap]   2. ./bootstrap.sh up stalwart-redis-router   # repoints Stalwart at the new primary"
+  echo "[bootstrap]   3. set STALWART_REDIS_ROLE=primary in THIS host's .env (tidy-up for restarts)"
+  echo "[bootstrap] When the old primary's host returns: set STALWART_REDIS_ROLE=standby and point"
+  echo "[bootstrap] STALWART_REDIS_PRIMARY_MAGIC_NAME at the new primary in its .env, then"
+  echo "[bootstrap] ./bootstrap.sh restart stalwart-redis — it resyncs automatically. No"
+  echo "[bootstrap] pg-rejoin-style re-clone command needed. NEVER let it resume as a second"
+  echo "[bootstrap] primary — that's split-brain, just quieter than Postgres about it."
+}
+
 cmd_up() {
   local stack="${1:-}"
   [[ -n "$stack" ]] || die "Usage: ./bootstrap.sh up <stack>"
@@ -1077,6 +1166,13 @@ cmd_up() {
     return 0
   fi
 
+  # stalwart-redis-router (HA Stalwart Redis endpoint): same trick as
+  # pg-router, for Stalwart's dedicated Redis pair.
+  if [[ "$stack" == "stalwart-redis-router" ]]; then
+    _cmd_up_stalwart_redis_router
+    return 0
+  fi
+
   # shared-db STANDBY: a different bring-up (Postgres only, clone from the
   # primary — no Redis, no app-DB provisioning). Primary falls through.
   if [[ "$stack" == "shared-db" && "${PG_ROLE:-primary}" == "standby" ]]; then
@@ -1092,6 +1188,20 @@ cmd_up() {
       [[ -n "${!v:-}" ]] || \
         die "${v} is not set in .env. Generate one: openssl rand -hex 32"
     done
+  fi
+
+  # stalwart-redis STANDBY: redis-stalwart-entrypoint.sh handles replicaof at
+  # startup — no separate clone step. Primary falls through.
+  if [[ "$stack" == "stalwart-redis" && "${STALWART_REDIS_ROLE:-primary}" == "standby" ]]; then
+    _cmd_up_stalwart_redis_standby
+    return 0
+  fi
+
+  # stalwart-redis preflight: refuses to start without a password — an empty
+  # ${VAR} would silently expand to `--requirepass ''`, disabling auth.
+  if [[ "$stack" == "stalwart-redis" ]]; then
+    [[ -n "${STALWART_REDIS_PASSWORD:-}" ]] || \
+      die "STALWART_REDIS_PASSWORD is not set in .env. Generate one: openssl rand -hex 32"
   fi
 
   # Provision DB for app stacks (idempotent — safe on fresh or existing
@@ -1669,6 +1779,7 @@ Usage: ./bootstrap.sh <command> [args]
   provision-stalwart                        Configure Stalwart via JMAP (auto-run by 'up stalwart')
   pg-promote                                Promote this Postgres standby to primary (failover)
   pg-rejoin                                 Re-clone this host as a fresh standby (post-failover)
+  stalwart-redis-promote                    Promote this Stalwart Redis standby to primary (failover)
   user-create         <app> <user> <email>  Create an admin user
   backup-cron                               Install the nightly pg-backup cron (interactive)
 
@@ -1680,6 +1791,11 @@ Postgres HA (see README "Postgres high availability"):
   ./bootstrap.sh up pg-router          # app-facing endpoint -> current primary
   ./bootstrap.sh pg-promote            # on the standby, during a failover
   ./bootstrap.sh pg-rejoin             # re-clone a returned old primary as the new standby
+
+Stalwart Redis HA (see README "Stalwart Redis high availability"):
+  ./bootstrap.sh up stalwart-redis            # primary (default) or standby host (STALWART_REDIS_ROLE)
+  ./bootstrap.sh up stalwart-redis-router     # Stalwart-facing endpoint -> current primary
+  ./bootstrap.sh stalwart-redis-promote       # on the standby, during a failover
 
 Examples:
   ./bootstrap.sh up shared-db
@@ -1715,6 +1831,7 @@ case "$command" in
   provision-stalwart)    cmd_provision_stalwart ;;
   pg-promote)            cmd_pg_promote ;;
   pg-rejoin)             cmd_pg_rejoin ;;
+  stalwart-redis-promote) cmd_stalwart_redis_promote ;;
   user-create)           cmd_user_create "$@" ;;
   backup-cron)           cmd_backup_cron ;;
   help|--help|-h) usage ;;

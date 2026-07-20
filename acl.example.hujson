@@ -79,6 +79,12 @@
     // Stalwart mail server (SMTP, IMAP, JMAP/admin)
     "tag:stalwart":              ["autogroup:admin", "tag:stalwart"],
 
+    // Stalwart's OWN dedicated Redis instance (separate from tag:db-redis —
+    // see .env.example's Redis section for why). Same self-owns-itself
+    // pattern as tag:db-postgres, since it's the same OAuth-node-creation
+    // gotcha.
+    "tag:stalwart-redis":        ["autogroup:admin", "tag:stalwart-redis"],
+
     // Authelia SSO / OIDC provider
     "tag:authelia":              ["autogroup:admin", "tag:authelia"],
 
@@ -131,8 +137,8 @@
     // App tiers reach the main shared Redis on TCP/6379 only.
     // GoToSocial is intentionally omitted — it has no Redis dependency.
     // Lemmy is intentionally omitted — it uses Postgres only.
-    // Stalwart is included — provision-stalwart wires its in-memory store
-    // to Redis logical DB 3 on this instance.
+    // Stalwart is NOT here — it has its own dedicated instance (next grant),
+    // not a logical DB on this one (see .env.example's Redis section).
     // Authelia is intentionally NOT here: its session store runs in the
     // dedicated redis-authelia instance on TCP/6380 (next grant), so a
     // compromised app tier cannot reach SSO session state (SECURITY.md §5.7).
@@ -143,7 +149,6 @@
         "tag:diaspora-web",
         "tag:funkwhale-web", "tag:funkwhale-worker",
         "tag:peertube-web",
-        "tag:stalwart",
       ],
       "dst": ["tag:db-redis"],
       "ip":  ["tcp:6379"],
@@ -156,6 +161,31 @@
       "src": ["tag:authelia"],
       "dst": ["tag:db-redis"],
       "ip":  ["tcp:6380"],
+    },
+
+    // Stalwart reaches its OWN dedicated Redis instance on TCP/6379 (a
+    // different tailnet node than tag:db-redis — see the previous grant's
+    // comment). In an HA deployment the app-facing endpoint
+    // (STALWART_REDIS_MAGIC_NAME) is the stalwart-redis-router sidecar,
+    // which also carries tag:stalwart-redis — so this same grant covers
+    // Stalwart -> router. The router -> primary and standby -> primary hops
+    // are the tag:stalwart-redis self-grant just below.
+    {
+      "src": ["tag:stalwart"],
+      "dst": ["tag:stalwart-redis"],
+      "ip":  ["tcp:6379"],
+    },
+
+    // Stalwart Redis HA (optional): node-to-node on TCP/6379. Every
+    // stalwart-redis node and the router carry tag:stalwart-redis, so this
+    // one self-grant covers BOTH the standby -> primary replication
+    // connection and the router -> current-primary hop. Harmless for a
+    // single node (nothing dials it). See README "Stalwart Redis high
+    // availability".
+    {
+      "src": ["tag:stalwart-redis"],
+      "dst": ["tag:stalwart-redis"],
+      "ip":  ["tcp:6379"],
     },
 
     // Stalwart mail server — reached by the L4 edge on all mail ports plus

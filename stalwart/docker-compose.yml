@@ -44,11 +44,14 @@ services:
       - NET_ADMIN
       - NET_RAW
     healthcheck:
-      # Gate on postgres AND garage — Stalwart's admin web SPA is stored in
-      # S3 (Garage). If Garage isn't reachable on first boot, the UI blob
-      # write fails silently and the admin site never loads. This is the exact
-      # failure mode that motivated the nc-check pattern (see LESSONS.md).
-      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:9002/healthz && nc -z -w3 ${DB_MAGIC_NAME}.${TS_TAILNET} 5432 && nc -z -w3 ${GARAGE_S3_ENDPOINT_NAME:-garage}.${TS_TAILNET} 3900"]
+      # Gate on postgres, garage, AND Stalwart's own dedicated Redis —
+      # Stalwart's admin web SPA is stored in S3 (Garage), and provision-
+      # stalwart's in-memory-store JMAP call needs Redis reachable. If any
+      # of the three isn't up yet, the failure is silent/confusing rather
+      # than a clean error. This is the exact failure mode that motivated
+      # the nc-check pattern (see LESSONS.md). Bring up stalwart-redis
+      # before stalwart (see README "Stalwart: first-boot configuration").
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:9002/healthz && nc -z -w3 ${DB_MAGIC_NAME}.${TS_TAILNET} 5432 && nc -z -w3 ${GARAGE_S3_ENDPOINT_NAME:-garage}.${TS_TAILNET} 3900 && nc -z -w3 ${STALWART_REDIS_MAGIC_NAME}.${TS_TAILNET} 6379"]
       interval: 10s
       timeout: 15s
       retries: 6
