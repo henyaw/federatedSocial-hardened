@@ -1,0 +1,75 @@
+# stalwart-redis-router — the stable, Stalwart-facing Redis endpoint for an
+# HA deployment of Stalwart's dedicated Redis pair.
+#
+# WHAT IT IS. A tiny nginx stream (L4 TCP) proxy behind a Tailscale sidecar
+# that takes the STALWART_REDIS_MAGIC_NAME identity. Stalwart keeps dialing
+# ${STALWART_REDIS_MAGIC_NAME}.${TS_TAILNET}:6379 exactly as before — no
+# provision-stalwart re-run needed — and this forwards to whichever node is
+# currently the primary (STALWART_REDIS_PRIMARY_MAGIC_NAME). On failover you
+# promote the standby and re-point this router; Stalwart's connection drops
+# and reconnects through it to the new primary. See README "Stalwart Redis
+# high availability".
+#
+# ONLY for multi-host HA. A single-node deployment doesn't run this stack —
+# Stalwart reaches the one Redis node directly (STALWART_REDIS_MAGIC_NAME ==
+# that node).
+#
+# Runs on the same host as Stalwart (co-located with the client it serves).
+# Bring up with:  ./bootstrap.sh up stalwart-redis-router
+# (which generates nginx.runtime.conf from nginx.conf first).
+
+name: federated-stalwart-redis-router
+
+services:
+
+  ts-stalwart-redis-router:
+    image: tailscale/tailscale:${TAILSCALE_VERSION:-v1.98.4}
+    # Takes the Stalwart-facing Redis endpoint name. This is the whole
+    # trick: Stalwart dials STALWART_REDIS_MAGIC_NAME and lands on the
+    # router, not on a fixed Redis node.
+    hostname: ${STALWART_REDIS_MAGIC_NAME}
+    environment:
+      TS_AUTHKEY: ${TS_OAUTH_CLIENT_SECRET}?ephemeral=true
+      # Same tag as the Redis nodes: Stalwart already has
+      # tag:stalwart-redis:6379, and the router -> primary hop is the
+      # tag:stalwart-redis self-grant in the ACL.
+      TS_EXTRA_ARGS: --advertise-tags=tag:stalwart-redis
+      TS_HOSTNAME: ${STALWART_REDIS_MAGIC_NAME}
+      TS_ACCEPT_DNS: "true"
+      TS_AUTH_ONCE: "true"
+      TS_USERSPACE: "false"
+      TS_ENABLE_HEALTH_CHECK: "true"
+      TS_LOCAL_ADDR_PORT: "127.0.0.1:9002"
+    dns: [1.1.1.1, 1.0.0.1]
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:9002/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 30s
+    restart: unless-stopped
+
+  stalwart-redis-router:
+    image: nginx:1.27-alpine
+    network_mode: "service:ts-stalwart-redis-router"
+    # nginx.runtime.conf is generated from nginx.conf by
+    # `up stalwart-redis-router` (and rewritten on failover). Gitignored;
+    # never edit it by hand.
+    volumes:
+      - ./nginx.runtime.conf:/etc/nginx/nginx.conf:ro
+    healthcheck:
+      # nginx up + able to open a TCP session to the configured primary.
+      test: ["CMD-SHELL", "nc -z -w3 127.0.0.1 6379 || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 4
+      start_period: 20s
+    depends_on:
+      ts-stalwart-redis-router:
+        condition: service_healthy
+    restart: unless-stopped

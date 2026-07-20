@@ -184,15 +184,16 @@ Paste those into your `.env`. You can now opt any app into S3 storage by setting
 
 ### 7. (Optional) Bring up Stalwart mail server
 
-Stalwart handles SMTP, IMAP, and JMAP for your instances. It stores its full configuration in Postgres and mail blobs in Garage — both must be up and provisioned before starting Stalwart.
+Stalwart handles SMTP, IMAP, and JMAP for your instances. It stores its full configuration in Postgres, mail blobs in Garage, and its in-memory store (rate limiting, fail2ban, locks, ACME tokens, greylisting) in its own dedicated Redis instance — all three must be up and provisioned before starting Stalwart.
 
-Fill in the Stalwart section of `.env` first (at minimum `STALWART_FALLBACK_ADMIN_SECRET`, the `STALWART_DB_*` credentials, and the `STALWART_GARAGE_KEY_*` pair from step 6 — the only key granted the private mail bucket).
+Fill in the Stalwart section of `.env` first (at minimum `STALWART_FALLBACK_ADMIN_SECRET`, the `STALWART_DB_*` credentials, `STALWART_REDIS_PASSWORD`, and the `STALWART_GARAGE_KEY_*` pair from step 6 — the only key granted the private mail bucket).
 
 ```bash
+./bootstrap.sh up stalwart-redis
 ./bootstrap.sh up stalwart
 ```
 
-This generates `stalwart/config/config.runtime.json` and starts the container. The sidecar healthcheck gates on Postgres (port 5432) *and* Garage (port 3900) before releasing Stalwart, so it waits rather than crash-loops if backends aren't ready yet.
+`stalwart-redis` is a single node by default — see [Stalwart Redis high availability](#stalwart-redis-high-availability) if you want a hot replica later. This generates `stalwart/config/config.runtime.json` and starts the container. The sidecar healthcheck gates on Postgres (port 5432), Garage (port 3900), *and* stalwart-redis (port 6379) before releasing Stalwart, so it waits rather than crash-loops if backends aren't ready yet.
 
 After the container is running, **finish setup in the admin UI before mail will flow** — see [Stalwart: first-boot configuration](#stalwart-first-boot-configuration).
 
@@ -446,7 +447,9 @@ Single-node Stalwart is the default and needs none of this. This section is for 
 
 **Why this is low-effort compared to Postgres/Garage HA.** Stalwart's clustering model is stateless-by-design: a node holds no authoritative state of its own. Accounts, domains, DKIM keys, and every setting live in the shared Postgres (already covered by [Postgres high availability](#postgres-high-availability)); mail bodies live in the shared Garage bucket (already covered by [Multi-node Garage cluster](#multi-node-garage-cluster)); the full-text search index defaults to living inside that same Postgres store too. Point a second node at the same three backends and it's already running the same mailboxes — there's no data to replicate between the two Stalwart processes themselves.
 
-**What does need coordinating** is soft, best-effort signaling between nodes — "a mailbox changed," "an IMAP client is IDLE-waiting," "a cert was just renewed, don't also request one." Stalwart calls this the **coordinator**, and it reuses this stack's existing Redis (the same connection already wired for Stalwart's in-memory store) rather than needing anything new. Redis being single-instance in this stack (deliberately — see the Redis section of `.env.example`) means this coordination can drop out during a Redis outage; that only costs responsiveness (a push notification arrives late, or two nodes briefly both attempt a cert renewal), never correctness, since Postgres and Garage remain the source of truth throughout.
+**What does need coordinating** is soft, best-effort signaling between nodes — "a mailbox changed," "an IMAP client is IDLE-waiting," "a cert was just renewed, don't also request one." Stalwart calls this the **coordinator**, and it reuses Stalwart's Redis connection (the same one already wired for its in-memory store) rather than needing anything new. Stalwart's own docs describe the coordinator's pub/sub as best-effort and non-persistent, so losing it costs responsiveness only — a push notification arrives late, or two nodes briefly both attempt a cert renewal — never correctness, since Postgres and Garage remain the source of truth throughout.
+
+That said, Stalwart's Redis connection backs more than the coordinator: rate limiting, fail2ban/blocked-IP counters, distributed locks, OAuth authorization codes, ACME tokens, and greylisting tokens all live there too, and Stalwart's docs don't specify whether *those* checks fail open (skipped, mail keeps flowing) or fail closed (blocked, or stalled for the ~10s default Redis timeout) if Redis becomes unreachable. So treat "responsiveness, not correctness" as confirmed for the coordinator specifically — not as a blanket guarantee for everything sharing that connection. This isn't new risk from clustering; it's true for a single Stalwart node too. If it matters to you, [Stalwart Redis high availability](#stalwart-redis-high-availability) below gives that connection the same primary/standby + manual-promote treatment as Postgres, scoped to Stalwart alone (the fediverse apps' shared Redis stays single-instance, per the reasoning in `.env.example`'s Redis section).
 
 **What this buys you, precisely.** Two fully independent SMTP/IMAP servers means inbound mail delivery survives the total loss of either host — sending mail servers retry the next `MX` record for days, which is exactly your failure window. It does **not** give you automatic IMAP/JMAP/webmail failover: mail clients are configured with one fixed hostname, and DNS doesn't have an `MX`-style priority mechanism for those protocols. During an outage, mail keeps arriving (queued on node 2) but node 1's mailbox users can't fetch it until either node 1 returns or you manually repoint that hostname's DNS at node 2 — the same "acceptable manual step during a rare, already-severe incident" tradeoff this repo makes for Postgres promotion.
 
@@ -458,7 +461,31 @@ Single-node Stalwart is the default and needs none of this. This section is for 
 4. Deploy `stalwart/caddy/` on node 2's **own** public-facing box, `.env`'s `STALWART_MAGIC_NAME` pointing at node 2. **Omit the `"web"` `:443` server block** in its `caddy.json` (the template already anticipates this — "a mail-only edge omits this server"): `MTA-STS`/`autoconfig`/`autodiscover` stay node-1-only, a deliberate asymmetry rather than an oversight — those are low-stakes conveniences, not mail delivery. Give node 2 its **own narrow ACME cert** (its own hostname only, *not* a wildcard) via its own admin UI — this sidesteps any duplicate-issuance collision with node 1's wildcard cert entirely, since the two certs cover disjoint names.
 5. Add the second `MX` record from the previous section, pointing at node 2's edge hostname.
 
-No ACL changes are needed — both nodes carry `tag:stalwart`, and the existing tag-based grants (`tag:stalwart → tag:db-postgres`, `→ tag:db-redis`, `→ tag:garage`, and `tag:reverse-proxy → tag:stalwart`) already cover any number of nodes. You do need to apply `tag:reverse-proxy` to node 2's edge host in the Tailscale admin console, same one-time step as any new reverse-proxy box.
+No ACL changes are needed — both nodes carry `tag:stalwart`, and the existing tag-based grants (`tag:stalwart → tag:db-postgres`, `→ tag:stalwart-redis`, `→ tag:garage`, and `tag:reverse-proxy → tag:stalwart`) already cover any number of nodes. You do need to apply `tag:reverse-proxy` to node 2's edge host in the Tailscale admin console, same one-time step as any new reverse-proxy box.
+
+### Stalwart Redis high availability
+
+Single-instance Redis is the default for Stalwart (like the rest of this stack) and needs none of this. This section gives *just Stalwart's* Redis connection the same primary/standby + manual-promote treatment as [Postgres high availability](#postgres-high-availability) — for operators who read the caveat two sections up and want to close that gap rather than accept it.
+
+**Why scoped to Stalwart only, not the shared Redis.** The fediverse apps' shared Redis (`REDIS_MAGIC_NAME`) stays single-instance stack-wide — see the Redis section of `.env.example` and `CLAUDE.md`'s open design questions: it's cache/queue there, and losing it just forces a re-login or a requeue. Stalwart is different: its Redis connection also gates rate limiting, fail2ban, distributed locks, ACME tokens, OAuth codes, and greylisting on the SMTP/IMAP hot path, with undocumented fail-open/fail-closed behavior (see the caveat above) — a real availability stake the shared apps' Redis doesn't carry. Giving the *shared* instance this same treatment would also require reconfiguring every app's Redis client for failover awareness (inconsistent support across Sidekiq/redis-rb, Predis, go-redis, redis-py) — exactly the per-app complexity this repo avoids. Splitting Stalwart onto its own instance keeps the blast radius of this HA work to one app, which is also why `stalwart-redis/` is a separate stack from `shared-db/` rather than a third instance bolted onto it.
+
+**Why it's simpler than Postgres HA.** Redis replication needs no `pg_basebackup`-style manual clone step: passing `--replicaof <primary> <port>` at startup is enough — `redis-server` performs the full sync itself in the background, and re-syncs automatically from its backlog on any reconnect. There's also no `pg-rejoin` equivalent: to rejoin a former primary as the new standby, just flip its role and primary pointer in `.env` and restart — no destructive re-clone command needed.
+
+**The pieces:**
+- **Primary + one hot replica**, each on a different host, each behind its own sidecar (`stalwart-redis/`). Set per host: `STALWART_REDIS_ROLE` (`primary`/`standby`) and `STALWART_REDIS_NODE_MAGIC_NAME` (e.g. `stalwart-redis-primary` / `stalwart-redis-standby`). Shared: `STALWART_REDIS_PASSWORD` (also serves as the replication auth — Redis has no separate replication role the way Postgres does) and `STALWART_REDIS_PRIMARY_MAGIC_NAME`.
+- **`stalwart-redis-router`** — a tiny nginx-stream sidecar (`stalwart-redis-router/`) that *takes the `STALWART_REDIS_MAGIC_NAME` identity*. Stalwart keeps dialing `${STALWART_REDIS_MAGIC_NAME}.${TS_TAILNET}:6379` unchanged; the router forwards to `STALWART_REDIS_PRIMARY_MAGIC_NAME`. Same single-upstream-forwarder pattern as `pg-router`.
+- **ACL**: the `tag:stalwart-redis → tag:stalwart-redis:6379` self-grant covers both standby→primary replication and router→primary.
+
+**Bring-up:**
+1. **Primary host** — set `STALWART_REDIS_ROLE=primary`, `STALWART_REDIS_NODE_MAGIC_NAME=stalwart-redis-primary`, and `STALWART_REDIS_PASSWORD` (`openssl rand -hex 32`, matching what Stalwart itself already uses). `./bootstrap.sh up stalwart-redis`.
+2. **Standby host** — its own `.env` with `STALWART_REDIS_ROLE=standby`, `STALWART_REDIS_NODE_MAGIC_NAME=stalwart-redis-standby`, `STALWART_REDIS_PRIMARY_MAGIC_NAME=stalwart-redis-primary`, the same `STALWART_REDIS_PASSWORD`, and `TS_TAILNET`. `./bootstrap.sh up stalwart-redis` — it starts replicating immediately, no separate clone wait. Verify on the primary: `docker exec <primary> redis-cli -a "$STALWART_REDIS_PASSWORD" --no-auth-warning info replication`.
+3. **Stalwart's host** — set `STALWART_REDIS_MAGIC_NAME` (unchanged — the name Stalwart already dials) and `STALWART_REDIS_PRIMARY_MAGIC_NAME=stalwart-redis-primary`. `./bootstrap.sh up stalwart-redis-router`. No `provision-stalwart` re-run needed — Stalwart's config already points at the stable `STALWART_REDIS_MAGIC_NAME` endpoint.
+
+**Failover runbook (primary host is gone):**
+1. On the **standby**: `./bootstrap.sh stalwart-redis-promote` — runs `REPLICAOF NO ONE`, immediately writable.
+2. On the **router host**: set `STALWART_REDIS_PRIMARY_MAGIC_NAME=stalwart-redis-standby` in `.env`, then `./bootstrap.sh up stalwart-redis-router` — Stalwart's connection drops and reconnects through it to the new primary.
+3. Tidy-up: set `STALWART_REDIS_ROLE=primary` in the promoted host's `.env` so it stays primary across restarts.
+4. When the **old primary's host returns**: set `STALWART_REDIS_ROLE=standby` + `STALWART_REDIS_PRIMARY_MAGIC_NAME=stalwart-redis-standby` in its `.env`, then `./bootstrap.sh restart stalwart-redis` — it replicates fresh from the new primary automatically. **Never** let the old primary resume as a second primary — split-brain applies to Redis too, it's just quieter about it (silent last-writer-wins on reconnect, no crash).
 
 ---
 
@@ -695,6 +722,7 @@ The Redis-auth, per-app-Garage-key, and Postgres `pg_hba` changes (from the `SEC
 4. `./bootstrap.sh provision-garage` — mints the per-app keys and prints the `<APP>_GARAGE_KEY_ID`/`SECRET` pairs once; paste them into `.env`.
 5. `./bootstrap.sh restart <app>` for each running app stack (and `restart stalwart` re-runs its provisioning, which rewires its Redis URL and Garage key).
 6. After everything is green and one `pg-backup.sh` run has succeeded, delete the old all-bucket key: `provision-garage` prints the exact `garage key delete` command while it still exists.
+7. Running Stalwart? Its in-memory store moved off the shared Redis (logical DB 3) onto its own dedicated instance. Set `STALWART_REDIS_PASSWORD` in `.env`, `./bootstrap.sh up stalwart-redis`, then `./bootstrap.sh provision-stalwart` to repoint it — Stalwart's connection URL changes but nothing else does. Add `tag:stalwart-redis` to your ACL and OAuth client tags first (from the current `acl.example.hujson`). Whatever was on the old DB 3 (rate-limit counters, greylist tokens, in-flight locks) is abandoned, not migrated — it's all short-lived tracking data, not mail, so this is safe.
 
 Anything outside this repo that probed Redis unauthenticated (e.g. a dashboard) now needs the password. Authelia sessions move to the new instance, so users will have to sign in again once.
 
