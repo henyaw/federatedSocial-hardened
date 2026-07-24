@@ -207,11 +207,17 @@ identity_providers:
     # client; the app itself enforces the `admins` group. (If that group doesn't
     # arrive via userinfo, uncomment the `hog` claims-policy above and add
     # `claims_policy: hog` here.)
+    # nuxt-auth-utils (packages/auth) sends the client secret in the token-
+    # request body, so this MUST be client_secret_post. Authelia defaults
+    # confidential clients to client_secret_basic, which fails the token
+    # exchange with "…does not allow this method" and bounces the operator
+    # to "Sign-in failed" — same trap as the peertube client above.
       - client_id: console
         client_name: Console
         client_secret: "__CONSOLE_OIDC_HASH__"
         public: false
         authorization_policy: one_factor
+        token_endpoint_auth_method: client_secret_post
         redirect_uris:
           - https://__CONSOLE_URL__/auth/authelia
         scopes: [openid, profile, email, groups]
@@ -225,11 +231,14 @@ identity_providers:
     #   __BABELFISH_URL__       <- BABELFISH_URL from .env
     # NOT wired yet: until BABELFISH_OIDC_CLIENT_SECRET is set in BOTH .env files,
     # bootstrap hashes a throwaway → this stays a valid-but-unused client.
+    # Same nuxt-auth-utils handler as console — creds go in the POST body, so
+    # this MUST be client_secret_post too.
       - client_id: babelfish
         client_name: Babelfish
         client_secret: "__BABELFISH_OIDC_HASH__"
         public: false
         authorization_policy: one_factor
+        token_endpoint_auth_method: client_secret_post
         redirect_uris:
           - https://__BABELFISH_URL__/auth/authelia
         scopes: [openid, profile, email, groups]

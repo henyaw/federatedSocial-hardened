@@ -151,8 +151,12 @@ services:
       - peertube-config:/config
       - peertube-data:/data
     healthcheck:
-      # /api/v1/ping returns "pong" once the app is up.
-      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:9000/api/v1/ping"]
+      # /api/v1/ping returns "pong" once the app is up. Use curl, NOT wget:
+      # the chocobozzz/peertube Debian image ships curl but no wget, so a
+      # wget check exits -1 (exec-not-found) forever and flags the container
+      # unhealthy while the site is fine. (The sidecar's wget check is OK —
+      # Alpine has wget.)
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:9000/api/v1/ping"]
       interval: 30s
       timeout: 10s
       retries: 3
