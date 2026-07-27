@@ -131,6 +131,9 @@ ts-<role>:
   cap_add:
     - NET_ADMIN
     - NET_RAW
+  # containerboot (PID 1) never reaps: orphans from the healthcheck or a
+  # `docker exec` would zombie forever. tini reaps; SIGTERM still forwards.
+  init: true
   healthcheck:
     test: ["CMD", "wget", "-qO-", "http://127.0.0.1:9002/healthz"]
     interval: 10s
@@ -146,6 +149,7 @@ Notes on each setting (do not change without reason):
 - `TS_ACCEPT_DNS: "true"` — required for MagicDNS resolution inside the namespace. Without this, `${DB_MAGIC_NAME}.${TS_TAILNET}` won't resolve. **Never omit.**
 - `TS_ENABLE_HEALTH_CHECK: "true"` + `TS_LOCAL_ADDR_PORT: "127.0.0.1:9002"` — exposes `/healthz` for Compose to wait on. Bind to 127.0.0.1, never `0.0.0.0` or `[::]`, so it isn't reachable across the tailnet.
 - Ephemeral auth: the `?ephemeral=true` suffix on the auth key is required. Do not remove it without also adding `TS_STATE_DIR` and a persistent volume.
+- `init: true` — containerboot (the Tailscale image's PID 1) never reaps child processes. The healthcheck above forks a `wget`/`nc` pipeline; if Docker kills it mid-run on timeout, the orphaned child reparents to PID 1 and zombies for the container's lifetime (confirmed empirically, not just in theory — see the commit that added this). `tini` still forwards `SIGTERM`, so nothing about shutdown changes. Any app container whose healthcheck also forks a helper (`ps | grep`, etc.) and whose PID 1 isn't already an init (check the image's own `ENTRYPOINT` — Mastodon's is `tini --`, so its containers are already covered) needs the same `init: true`.
 
 ## App container pattern
 

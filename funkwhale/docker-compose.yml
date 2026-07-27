@@ -103,6 +103,9 @@ services:
     cap_add:
       - NET_ADMIN
       - NET_RAW
+    # containerboot (PID 1) never reaps: orphans from the healthcheck or a
+    # `docker exec` would zombie forever. tini reaps; SIGTERM still forwards.
+    init: true
     healthcheck:
       test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:9002/healthz && nc -z -w3 ${DB_MAGIC_NAME}.${TS_TAILNET} 5432 && nc -z -w3 ${REDIS_MAGIC_NAME}.${TS_TAILNET} 6379"]
       interval: 10s
@@ -195,6 +198,9 @@ services:
     cap_add:
       - NET_ADMIN
       - NET_RAW
+    # containerboot (PID 1) never reaps: orphans from the healthcheck or a
+    # `docker exec` would zombie forever. tini reaps; SIGTERM still forwards.
+    init: true
     healthcheck:
       test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:9002/healthz && nc -z -w3 ${DB_MAGIC_NAME}.${TS_TAILNET} 5432 && nc -z -w3 ${REDIS_MAGIC_NAME}.${TS_TAILNET} 6379"]
       interval: 10s
@@ -209,6 +215,11 @@ services:
     image: funkwhale/api:${FUNKWHALE_VERSION:-1.3.4}
     network_mode: "service:ts-funkwhale-worker"
     command: ["celery", "-A", "funkwhale_api.taskapp", "worker", "-l", "info", "--concurrency=0"]
+    # The image has no ENTRYPOINT, so PID 1 is `celery worker` itself — not an
+    # init, and it never reaps. The healthcheck below is a pipeline: it forks a
+    # `ps` + `grep` pair on every run, and if one is killed mid-run the pair is
+    # reparented to PID 1 and zombies permanently. tini reaps them.
+    init: true
     environment:
       <<: *api-env
       C_FORCE_ROOT: "true"
@@ -230,6 +241,9 @@ services:
     image: funkwhale/api:${FUNKWHALE_VERSION:-1.3.4}
     network_mode: "service:ts-funkwhale-worker"
     command: ["celery", "-A", "funkwhale_api.taskapp", "beat", "-l", "info"]
+    # Same reaping problem as `celeryworker` above: PID 1 is `celery beat`, a
+    # plain scheduler, and the healthcheck forks a `ps`/`grep` pair per run.
+    init: true
     environment:
       <<: *api-env
     healthcheck:

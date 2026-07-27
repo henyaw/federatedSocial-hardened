@@ -40,6 +40,9 @@ services:
     cap_add:
       - NET_ADMIN
       - NET_RAW
+    # containerboot (PID 1) never reaps: orphans from the healthcheck or a
+    # `docker exec` would zombie forever. tini reaps; SIGTERM still forwards.
+    init: true
     healthcheck:
       # Lemmy has no Redis dependency — gate on Postgres only.
       test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:9002/healthz && nc -z -w3 ${DB_MAGIC_NAME}.${TS_TAILNET} 5432"]

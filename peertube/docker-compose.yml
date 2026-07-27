@@ -43,6 +43,9 @@ services:
     cap_add:
       - NET_ADMIN
       - NET_RAW
+    # containerboot (PID 1) never reaps: orphans from the healthcheck or a
+    # `docker exec` would zombie forever. tini reaps; SIGTERM still forwards.
+    init: true
     healthcheck:
       test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:9002/healthz && nc -z -w3 ${DB_MAGIC_NAME}.${TS_TAILNET} 5432 && nc -z -w3 ${REDIS_MAGIC_NAME}.${TS_TAILNET} 6379"]
       interval: 10s
