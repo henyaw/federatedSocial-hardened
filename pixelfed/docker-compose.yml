@@ -189,6 +189,11 @@ services:
     entrypoint: ["/usr/local/bin/ts-entrypoint.sh"]
     command: ["gosu", "www-data", "php", "artisan", "horizon"]
     stop_signal: SIGTERM
+    # PID 1 here is `php artisan horizon`, which is not an init and never reaps.
+    # If the healthcheck below is killed mid-run, its forked `php` + `grep` pair
+    # is reparented to PID 1 and lingers as a zombie permanently — an unbounded
+    # PID leak. tini reaps them and still forwards SIGTERM to Horizon.
+    init: true
     environment:
       <<: *pixelfed-env
       DOCKER_SERVICE_NAME: "worker"
@@ -216,6 +221,9 @@ services:
     entrypoint: ["/usr/local/bin/ts-entrypoint.sh"]
     command: ["gosu", "www-data", "php", "artisan", "schedule:work"]
     stop_signal: SIGTERM
+    # Same reaping problem as `worker` above: PID 1 is `php artisan schedule:work`,
+    # and the healthcheck below forks a `ps`/`grep` pair on every run.
+    init: true
     environment:
       <<: *pixelfed-env
       DOCKER_SERVICE_NAME: "cron"
