@@ -542,6 +542,13 @@ _sw_call() {
 
 _sw_ok() {
   local r="$1"
+  # Validate the envelope FIRST. A 401/404/5xx body is not JMAP at all, so the
+  # two jq checks below would simply fail to match and this function would
+  # report success on a rejected call. Catch that here instead.
+  if ! echo "$r" | jq -e 'has("methodResponses")' >/dev/null 2>&1; then
+    die "Stalwart returned a non-JMAP response (auth or endpoint problem):
+  $(echo "$r" | head -c 300)"
+  fi
   if echo "$r" | jq -e '.methodResponses[0][0]=="error"' >/dev/null 2>&1; then
     die "JMAP error: $(echo "$r" | jq -c '.methodResponses[0][1]')"
   fi
@@ -564,45 +571,64 @@ _sw_find_id() {
 
 # Authenticate. Prefers the persistent admin@DOMAIN; falls back to the
 # first-boot virtual admin ("admin") if no real account exists yet.
+# Try one "user:password" against /jmap/session. Echoes the primary account ID
+# on success, returns non-zero on failure.
+#
+# The status code CANNOT be used to test authentication here. Stalwart answers
+# /jmap/session with 200 and an anonymous body when no credentials are sent,
+# and only returns 401 when credentials are sent and are wrong. So a 200 proves
+# nothing — `-u garbage:garbage` against an empty store would "pass". The only
+# reliable signal is whether the session body carries primaryAccounts.
+#
+# Note the key order: a real v0.16.7 session has NO urn:ietf:params:jmap:core
+# entry, so urn:stalwart:jmap is checked first, with a generic fallback to
+# whatever the first primaryAccounts value happens to be.
+_sw_try_auth() {
+  local cred="$1" session acct
+  session=$(curl -s -m 10 -u "$cred" "${_SW_JMAP}/session" 2>/dev/null) || return 1
+  acct=$(printf '%s' "$session" | jq -r '
+    .primaryAccounts["urn:stalwart:jmap"] //
+    .primaryAccounts["urn:ietf:params:jmap:core"] //
+    ((.primaryAccounts // {}) | to_entries | first | .value) //
+    empty
+  ' 2>/dev/null) || return 1
+  [[ -n "$acct" && "$acct" != "null" ]] || return 1
+  printf '%s' "$acct"
+}
+
+# Authenticate and populate _SW_AUTH + _SW_ACCT_ID, trying each plausible
+# credential in turn. Safe to call again mid-run: once a real admin account
+# exists, Stalwart's first-boot fallback goes inert and the earlier credential
+# stops working, so the caller re-runs this after creating the admin.
 _sw_auth() {
-  local u
-  for u in "admin@${STALWART_DOMAIN}" "admin"; do
-    if curl -s -m 8 -u "${u}:${STALWART_FALLBACK_ADMIN_SECRET}" \
-        -o /dev/null -w '%{http_code}' "${_SW_JMAP}/session" 2>/dev/null | grep -q 200; then
-      _SW_AUTH="${u}:${STALWART_FALLBACK_ADMIN_SECRET}"
-      echo "[bootstrap]   authenticated as ${u}"
+  local cand acct
+  local -a cands=()
+  # 1. The persistent admin, using its own password. This is the normal case
+  #    for any store that has already been set up — including one configured
+  #    through the web wizard, whose admin password is NOT the fallback secret.
+  [[ -n "${STALWART_ADMIN_PASSWORD:-}" ]] && \
+    cands+=("admin@${STALWART_DOMAIN}:${STALWART_ADMIN_PASSWORD}")
+  # 2. The persistent admin created by a previous run of this command, when
+  #    STALWART_ADMIN_PASSWORD was unset and the fallback secret was used.
+  cands+=("admin@${STALWART_DOMAIN}:${STALWART_FALLBACK_ADMIN_SECRET}")
+  # 3. The built-in fallback admin — only live while the config store is empty.
+  cands+=("admin:${STALWART_FALLBACK_ADMIN_SECRET}")
+
+  for cand in "${cands[@]}"; do
+    if acct=$(_sw_try_auth "$cand"); then
+      _SW_AUTH="$cand"
+      _SW_ACCT_ID="$acct"
+      echo "[bootstrap]   authenticated as ${cand%%:*} (account ${acct})"
       return 0
     fi
   done
-  die "Cannot authenticate to Stalwart at ${_SW_JMAP} — check STALWART_FALLBACK_ADMIN_SECRET"
-}
 
-# Populate _SW_ACCT_ID from the JMAP session response.
-_sw_get_acct_id() {
-  local session
-  session=$(curl -s -m 10 -u "$_SW_AUTH" "${_SW_JMAP}/session")
-  _SW_ACCT_ID=$(echo "$session" | jq -r '
-    .primaryAccounts["urn:ietf:params:jmap:core"] //
-    .primaryAccounts["urn:stalwart:jmap"] //
-    (.accounts | to_entries | first | .key) //
-    empty
-  ')
-  [[ -n "$_SW_ACCT_ID" ]] || \
-    die "Cannot determine JMAP account ID from session. Is Stalwart fully initialized?"
-  echo "[bootstrap]   JMAP account ID: ${_SW_ACCT_ID}"
-}
-
-# Switch to the persistent admin@DOMAIN after creating it. Once a real admin
-# exists, Stalwart's first-boot fallback goes inert — all subsequent calls
-# must use the real account or they will get 401.
-_sw_re_auth() {
-  local u="admin@${STALWART_DOMAIN}"
-  if curl -s -m 8 -u "${u}:${STALWART_FALLBACK_ADMIN_SECRET}" \
-      -o /dev/null -w '%{http_code}' "${_SW_JMAP}/session" 2>/dev/null | grep -q 200; then
-    _SW_AUTH="${u}:${STALWART_FALLBACK_ADMIN_SECRET}"
-    _sw_get_acct_id
-    echo "[bootstrap]   re-authenticated as ${u}"
-  fi
+  die "Cannot authenticate to Stalwart at ${_SW_JMAP}.
+  Tried: admin@${STALWART_DOMAIN} and the first-boot fallback admin.
+  If this Stalwart was configured through the web admin UI, its admin password
+  is whatever you set there — put it in STALWART_ADMIN_PASSWORD in .env.
+  On a genuinely fresh store, STALWART_FALLBACK_ADMIN_SECRET must match the
+  value the container booted with."
 }
 
 cmd_provision_stalwart() {
@@ -639,7 +665,6 @@ cmd_provision_stalwart() {
   done
 
   _sw_auth
-  _sw_get_acct_id
 
   # ── Blob store → Garage S3 ────────────────────────────────────────────────
   # GARAGE_S3_ENDPOINT_NAME defaults to the single node; set it to the
@@ -732,7 +757,7 @@ cmd_provision_stalwart() {
   echo "[bootstrap] Ensuring admin account (admin@${STALWART_DOMAIN})..."
   if [[ -z "$(_sw_find_id x:Account admin)" ]]; then
     _sw_ok "$(_sw_call "$(jq -nc \
-      --arg pw   "${STALWART_FALLBACK_ADMIN_SECRET}" \
+      --arg pw   "${STALWART_ADMIN_PASSWORD:-$STALWART_FALLBACK_ADMIN_SECRET}" \
       --arg dom  "$domain_id" \
       --arg acct "$_SW_ACCT_ID" \
       '[["x:Account/set",{"accountId":$acct,"create":{"a":{
@@ -748,9 +773,10 @@ cmd_provision_stalwart() {
     echo "[bootstrap]   admin account present"
   fi
 
-  # Switch to the persistent admin — the first-boot fallback goes inert once a
-  # real admin exists and will reject further calls with 401.
-  _sw_re_auth
+  # Re-authenticate. If the admin account was just created, the first-boot
+  # fallback we may have been using has gone inert and would 401 from here on.
+  # This dies on failure rather than silently continuing with stale credentials.
+  _sw_auth
 
   # ── Relay / catch-all account ─────────────────────────────────────────────
   echo "[bootstrap] Ensuring relay account (${relay_addr})..."
