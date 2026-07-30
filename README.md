@@ -71,6 +71,7 @@ Your reverse proxy on the host receives public HTTPS traffic and forwards it to 
 ./bootstrap.sh provision-db <app>         Idempotent DB role + database setup
 ./bootstrap.sh provision-garage           Idempotent Garage layout + buckets + key
 ./bootstrap.sh provision-stalwart         Configure Stalwart via JMAP (auto-run by 'up stalwart')
+./bootstrap.sh provision-pixelfed         Pixelfed OAuth personal access client (auto-run by 'up pixelfed')
 ./bootstrap.sh user-create <app> <user> <email>   Create an admin user
 ./bootstrap.sh backup-cron                Install the nightly pg-backup cron (interactive)
 ```
@@ -691,6 +692,16 @@ docker exec <funkwhale-api> funkwhale-manage shell -c \
   "from collections import Counter; from funkwhale_api.music.models import Upload; \
    print(Counter(Upload.objects.values_list('import_status', flat=True)))"
 ```
+
+**Pixelfed: creating an app/token at `/settings/applications` does nothing**
+
+The UI shows no error, but the `POST /oauth/personal-access-tokens` behind it returns HTTP 500 with `Personal access client not found. Please create one.` in the container log. Pixelfed's OAuth keys exist, but the Passport *personal access client* row doesn't — the image only creates it when `PF_LOGIN_WITH_MASTODON_ENABLED` is true, an unrelated feature flag. Fix it without turning on Mastodon login:
+
+```bash
+./bootstrap.sh provision-pixelfed
+```
+
+This is idempotent and now runs automatically on `./bootstrap.sh up pixelfed`, including after a database reprovision (the image's own "already did this" markers live in the storage volume, so they'd otherwise mask a missing row).
 
 **Sidecar shows "needs login" or doesn't appear in admin console**
 
